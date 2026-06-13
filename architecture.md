@@ -34,6 +34,9 @@
 12. [Безопасность и ограничения](#12-безопасность-и-ограничения)
 13. [Структура проекта](#13-структура-проекта)
 14. [Зависимости и технологический стек](#14-зависимости-и-технологический-стек)
+15. [Docker-инфраструктура](#15-docker-инфраструктура)
+16. [Поэтапный план разработки](#16-поэтапный-план-разработки-для-llm-агента)
+17. [Журнал архитектурных решений (ADR)](#17-журнал-архитектурных-решений-adr)
 
 ---
 
@@ -42,7 +45,7 @@
 | Проблема LLM | Архитектурное решение |
 |---|---|
 | Галлюцинации при математических операциях | Полное отчуждение арифметики — все вычисления выполняются **инструментами** (pandas, numpy, scipy), LLM только интерпретирует результат |
-| Неточное извлечение данных из документов | Чанкинг + семантический поиск (RAG) + **цифровой слепок** (хэши числовых значений) для верификации извлечённых данных |
+| Неточное извлечение данных из документов | Чанкинг + **BM25 keyword search** + **цифровой слепок** (хэши числовых значений) для верификации извлечённых данных |
 | Нестандартный вывод, сложно разбираемый UI | Все ответы агентов — строго **Pydantic-модели**; каждый тип блока имеет соответствующий React-компонент |
 | Потеря контекста при длинных задачах | Декомпозиция на **атомарные подзадачи** + общая «доска» с сжатым состоянием |
 | Бесконечные циклы исправлений | **TTL-счётчик** на задачу + escalation-политика + hard-stop |
@@ -82,14 +85,14 @@
 │  └───────────────────────────────┬──────────────────────────────────────┘  │
 │                                  │                                          │
 │  ┌───────────────────────────────▼──────────────────────────────────────┐  │
-│  │               DOCUMENT PIPELINE + VECTOR STORE                      │  │
-│  │         chunker · fingerprinter · embedder · retriever              │  │
+│  │               DOCUMENT PIPELINE + BM25 STORE                        │  │
+│  │         chunker · fingerprinter · BM25 retriever                    │  │
 │  └──────────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────────┘
                     │                              │
            ┌────────▼────────┐          ┌──────────▼──────────┐
-           │  PostgreSQL +   │          │  DeepSeek API /     │
-           │  pgvector       │          │  LLaMA (Ollama)     │
+           │  PostgreSQL     │          │  DeepSeek API /     │
+           │  (без pgvector) │          │  LLaMA (Ollama)     │
            └─────────────────┘          └─────────────────────┘
 ```
 
@@ -364,22 +367,27 @@ class FingerprintVerifier:
 - Если `NOT_FOUND` или `MISMATCH` → число не вставляется, Worker помечает его как `[UNVERIFIED]`
 - Critic проверяет отсутствие `[UNVERIFIED]` чисел в результате
 
-### 4.3 Векторное хранилище и RAG
+### 4.3 BM25-поиск по чанкам
+
+Векторные эмбеддинги (sentence-transformers) убраны из пайплайна — они требовали загрузки тяжёлой локальной модели и существенно замедляли обработку файлов. Вместо них используется **BM25-only** поиск, который работает мгновенно и не требует GPU или дополнительных зависимостей.
 
 ```
-Чанк → Embedder (sentence-transformers / OpenAI ada-002)
-      → pgvector (PostgreSQL extension)
+Чанк → сохранение текста в PostgreSQL (без векторного поля)
 
 При запросе Worker'а:
-  query_embedding = embed(task_description + key_terms)
-  chunks = vector_search(query_embedding, top_k=8, filter={file_id: ...})
+  bm25_index = BM25Okapi(all_chunks_for_file_ids)
+  chunks = bm25_index.get_top_k(tokenize(query), top_k=8)
   → передаётся Worker'у как контекст (не весь файл!)
 ```
 
-**Гибридный поиск (semantic + keyword):**
-- BM25 (rank_bm25) для ключевых числовых выражений
-- Cosine similarity для семантики
-- RRF (Reciprocal Rank Fusion) для объединения результатов
+**Токенизатор:** регулярный (поддерживает кириллицу + латиницу):
+```python
+re.findall(r"[а-яёА-ЯЁa-zA-Z0-9]+", text.lower())
+```
+
+**Компромисс:** BM25 уступает семантическому поиску при парафразах и синонимах, однако для аналитических документов (с числами, терминами, заголовками разделов) даёт сопоставимое качество при значительно меньшей латентности.
+
+> **Поле `embedding` в таблице `document_chunks`** оставлено в схеме БД (nullable), чтобы при необходимости можно было вернуть векторный поиск без миграции.
 
 ---
 
@@ -476,8 +484,8 @@ def analyze_sentiment(texts: list[str], granularity: SentimentGranularity) -> Se
     """VADER + transformers модель. Документ / предложение / аспект уровень."""
 
 @tool
-def extract_keywords(text: str, method: KeywordMethod, top_k: int) -> list[Keyword]:
-    """TF-IDF, RAKE, KeyBERT. С весами релевантности."""
+def extract_keywords(text: str, top_k: int) -> list[Keyword]:
+    """TF-частотный анализ. С весами релевантности (без локальных ML-моделей)."""
 
 @tool
 def extract_topics(texts: list[str], n_topics: int) -> TopicModelResult:
@@ -790,14 +798,14 @@ class ModelConfig(BaseModel):
     orchestration: str = "deepseek-reasoner"   # планирование — нужен reasoning
     worker: str = "deepseek-chat"              # выполнение — баланс
     critic: str = "deepseek-chat"              # проверка — достаточно
-    embedding: str = "BAAI/bge-m3"            # эмбеддинги — локально
+    # эмбеддинги не используются — поиск через BM25
 
 # LLaMA вариант (полностью локально через Ollama)
 class LlamaModelConfig(BaseModel):
     orchestration: str = "llama3.3:70b"       # или qwen2.5:72b
     worker: str = "llama3.1:8b"
     critic: str = "llama3.1:8b"
-    embedding: str = "nomic-embed-text"
+    # эмбеддинги не используются — поиск через BM25
 ```
 
 ---
@@ -813,7 +821,7 @@ backend/
 │   ├── api/
 │   │   ├── routes/
 │   │   │   ├── sessions.py        # POST /sessions, GET /sessions/{id}
-│   │   │   ├── reports.py         # GET /reports/{id}, GET /reports/{id}/stream
+│   │   │   ├── reports.py         # GET /reports, GET /reports/{id}, GET /reports/{id}/stream
 │   │   │   ├── files.py           # POST /files/upload, DELETE /files/{id}
 │   │   │   └── health.py
 │   │   └── deps.py                # Dependency injection
@@ -848,8 +856,8 @@ backend/
 │   │   ├── extractors/            # format-specific extractors
 │   │   ├── chunker.py
 │   │   ├── fingerprint.py         # NumericFingerprint
-│   │   ├── embedder.py
-│   │   └── retriever.py           # HybridRetriever (BM25 + vector)
+│   │   ├── embedder.py            # no-op заглушка (эмбеддинги отключены)
+│   │   └── retriever.py           # BM25Retriever (rank-bm25, без векторов)
 │   │
 │   ├── schemas/
 │   │   ├── blocks.py              # все ReportBlock Pydantic модели
@@ -934,57 +942,49 @@ async def execute_parallel_group(tasks: list[TaskSpec]):
 frontend/
 ├── src/
 │   ├── app/
-│   │   ├── App.tsx
-│   │   ├── Router.tsx
-│   │   └── providers/            # QueryClient, Theme, SSE
+│   │   ├── App.tsx               # BrowserRouter + Routes
+│   │   └── store.ts              # Zustand глобальный стор
 │   │
 │   ├── pages/
-│   │   ├── Home.tsx              # лендинг / новый отчёт
-│   │   ├── Report.tsx            # просмотр отчёта
-│   │   ├── History.tsx           # история отчётов
-│   │   └── Settings.tsx          # выбор LLM, модели
+│   │   ├── Home.tsx              # "/" — загрузка файлов + генерация отчёта
+│   │   ├── ReportsList.tsx       # "/reports" — список всех готовых отчётов
+│   │   └── ReportViewer.tsx      # "/reports/:sessionId" — просмотр отчёта
 │   │
 │   ├── features/
 │   │   ├── report-builder/
-│   │   │   ├── ReportCanvas.tsx  # контейнер блоков
-│   │   │   ├── BlockRenderer.tsx # диспетчер блоков по типу
-│   │   │   └── ReportExport.tsx  # PDF / DOCX экспорт
+│   │   │   ├── ReportCanvas.tsx  # контейнер блоков (с BlockErrorBoundary)
+│   │   │   └── BlockRenderer.tsx # диспетчер блоков по типу
 │   │   │
 │   │   ├── file-upload/
-│   │   │   ├── FileUploadZone.tsx
-│   │   │   └── FileList.tsx
+│   │   │   └── FileUploadZone.tsx
 │   │   │
 │   │   ├── query-input/
 │   │   │   └── QueryForm.tsx
 │   │   │
 │   │   └── agent-monitor/
-│   │       ├── AgentGraph.tsx    # визуализация DAG задач
-│   │       ├── TaskTimeline.tsx
-│   │       └── TokenCounter.tsx
+│   │       └── AgentMonitor.tsx
 │   │
 │   ├── components/
+│   │   ├── BlockErrorBoundary.tsx  # React Error Boundary — защита от краша блока
 │   │   ├── blocks/               # React-компоненты для каждого BlockType
 │   │   │   ├── TextBlock.tsx
 │   │   │   ├── KPICard.tsx
 │   │   │   ├── TableBlock.tsx
-│   │   │   ├── ChartBlock.tsx    # Vega-Lite через react-vega
+│   │   │   ├── ChartBlock.tsx    # Vega-Lite через vega-embed
 │   │   │   ├── InsightBlock.tsx
 │   │   │   ├── ComparisonBlock.tsx
 │   │   │   ├── ForecastBlock.tsx
 │   │   │   ├── RiskMatrix.tsx
 │   │   │   └── ExecutiveSummary.tsx
 │   │   │
-│   │   └── ui/                   # Shadcn компоненты
+│   │   └── ui/                   # Radix UI / Shadcn компоненты
 │   │
 │   ├── hooks/
-│   │   ├── useReportStream.ts    # SSE подписка на блоки
-│   │   ├── useTaskGraph.ts       # граф задач
-│   │   └── useFileUpload.ts
+│   │   └── useReportStream.ts    # SSE подписка на блоки
 │   │
 │   ├── lib/
-│   │   ├── api.ts                # typesafe API клиент (openapi-fetch)
-│   │   ├── schemas.ts            # TypeScript типы (из OpenAPI схемы)
-│   │   └── vega-helpers.ts
+│   │   ├── api.ts                # fetch-клиент + типы ответов
+│   │   └── utils.ts
 │   │
 │   └── types/
 │       └── blocks.ts             # зеркало Pydantic схем на TypeScript
@@ -994,57 +994,81 @@ frontend/
 └── package.json
 ```
 
-### BlockRenderer — центральный диспетчер
+### BlockRenderer и защита от сбоев
+
+Каждый блок оборачивается в `BlockErrorBoundary` — React Error Boundary класс-компонент. Если конкретный блок падает при рендере (например, невалидная Vega-Lite спецификация), страница **не становится белой**: вместо блока показывается сообщение об ошибке, остальные блоки продолжают работать.
 
 ```tsx
-// Каждый новый тип блока = 1 новый case в switch
+// ReportCanvas.tsx — каждый блок изолирован
+{blocks.map(block => (
+  <BlockErrorBoundary key={block.block_id}>
+    <BlockRenderer block={block} />
+  </BlockErrorBoundary>
+))}
+```
+
+```tsx
+// BlockRenderer — диспетчер по block_type
 const BlockRenderer: React.FC<{ block: ReportBlock }> = ({ block }) => {
-  const components: Record<string, React.ComponentType<any>> = {
-    text:              TextBlock,
-    kpi_card:          KPICard,
-    table:             TableBlock,
-    chart:             ChartBlock,
-    insight:           InsightBlock,
-    comparison:        ComparisonBlock,
-    forecast:          ForecastBlock,
-    risk_matrix:       RiskMatrix,
-    executive_summary: ExecutiveSummary,
-  };
-
-  const Component = components[block.block_type];
-  if (!Component) return <UnknownBlock block={block} />;
-
-  return (
-    <div className="relative">
-      {block.status === "partial" && <PartialWarningBadge warnings={block.warnings} />}
-      <Component {...block} />
-    </div>
-  );
+  switch (block.block_type) {
+    case 'text':              return <TextBlockComponent {...block} />
+    case 'kpi_card':          return <KPICardComponent {...block} />
+    case 'table':             return <TableBlockComponent {...block} />
+    case 'chart':             return <ChartBlockComponent {...block} />
+    case 'insight':           return <InsightBlockComponent {...block} />
+    case 'comparison':        return <ComparisonBlockComponent {...block} />
+    case 'forecast':          return <ForecastBlockComponent {...block} />
+    case 'risk_matrix':       return <RiskMatrixBlockComponent {...block} />
+    case 'executive_summary': return <ExecutiveSummaryComponent {...block} />
+    default: return <div>Неизвестный тип: {block.block_type}</div>
+  }
 };
 ```
+
+### Роутинг (react-router-dom v6)
+
+```tsx
+// App.tsx
+<BrowserRouter>
+  <Routes>
+    <Route path="/"                   element={<Home />} />
+    <Route path="/reports"            element={<ReportsList />} />
+    <Route path="/reports/:sessionId" element={<ReportViewer />} />
+  </Routes>
+</BrowserRouter>
+```
+
+| Маршрут | Компонент | Описание |
+|---|---|---|
+| `/` | `Home` | Загрузка файлов, ввод запроса, генерация отчёта в реальном времени |
+| `/reports` | `ReportsList` | Список всех завершённых отчётов (авторизация не требуется) |
+| `/reports/:id` | `ReportViewer` | Просмотр конкретного отчёта по session ID |
+
+Nginx настроен с `try_files $uri $uri/ /index.html` — SPA-роутинг работает при прямом переходе по URL.
 
 ### Streaming блоков в реальном времени
 
 ```tsx
-const useReportStream = (sessionId: string) => {
-  const [blocks, setBlocks] = useState<ReportBlock[]>([]);
-  const [tasks, setTasks] = useState<TaskStatus[]>([]);
+// useReportStream.ts — SSE подписка через Zustand store
+export function useReportStream(sessionId: string | null) {
+  const { addBlock, upsertTask, setGenerating } = useStore()
 
   useEffect(() => {
-    const es = new EventSource(`/api/reports/${sessionId}/stream`);
-    es.onmessage = (e) => {
-      const event = JSON.parse(e.data);
-      if (event.block_type) {
-        setBlocks(prev => [...prev, event].sort((a,b) => a.order - b.order));
-      } else if (event.type === "task_status") {
-        setTasks(prev => upsert(prev, event));
-      }
-    };
-    return () => es.close();
-  }, [sessionId]);
+    if (!sessionId) return
+    setGenerating(true)
+    const es = new EventSource(`/api/reports/${sessionId}/stream`)
 
-  return { blocks, tasks };
-};
+    es.onmessage = (e) => {
+      const event = JSON.parse(e.data)
+      if (event.type === 'block_approved') addBlock(event)
+      else if (event.type === 'task_status') upsertTask(event)
+      else if (event.type === 'session_done') { setGenerating(false); es.close() }
+    }
+
+    es.onerror = () => { setGenerating(false); es.close() }
+    return () => { es.close(); setGenerating(false) }
+  }, [sessionId])
+}
 ```
 
 ---
@@ -1124,7 +1148,7 @@ CREATE TABLE uploaded_files (
     fingerprint_json JSONB      -- NumericFingerprint
 );
 
--- Чанки документов с эмбеддингами (pgvector)
+-- Чанки документов (BM25-only поиск, pgvector не используется)
 CREATE TABLE document_chunks (
     id UUID PRIMARY KEY,
     file_id UUID REFERENCES uploaded_files(id),
@@ -1132,10 +1156,10 @@ CREATE TABLE document_chunks (
     chunk_type VARCHAR(20),     -- text, table, numeric
     content TEXT,
     metadata JSONB,
-    embedding vector(1024),     -- BGE-M3 размерность
+    embedding vector(1024),     -- nullable, зарезервировано (не заполняется)
     numeric_density FLOAT
 );
-CREATE INDEX ON document_chunks USING ivfflat (embedding vector_cosine_ops);
+-- Индекс ivfflat не создаётся (векторный поиск не используется)
 
 -- Граф задач
 CREATE TABLE tasks (
@@ -1248,18 +1272,15 @@ dependencies = [
     "scikit-learn>=1.5",      # ML, anomaly detection
     "rapidfuzz>=3.9",         # нечёткий поиск для fingerprint
 
-    # NLP
-    "sentence-transformers>=3.0",  # эмбеддинги
-    "vaderSentiment>=3.3",
-    "rake-nltk>=1.0",
-    "keybert>=0.8",
-    "nltk>=3.8",
+    # NLP (лёгкий набор — без локальных ML-моделей)
+    "vaderSentiment>=3.3",         # sentiment analysis
+    "nltk>=3.8",                   # токенизация, stopwords
 
-    # Vector store
+    # Хранилище и поиск (BM25-only, pgvector не используется активно)
     "sqlalchemy[asyncio]>=2.0",
     "asyncpg>=0.29",
-    "pgvector>=0.3",
-    "rank-bm25>=0.2",
+    "pgvector>=0.3",               # расширение установлено, но не используется для поиска
+    "rank-bm25>=0.2",              # основной механизм retrieval
 
     # Caching & messaging
     "redis[asyncio]>=5.0",
@@ -1277,20 +1298,17 @@ dependencies = [
   "dependencies": {
     "react": "^18",
     "react-dom": "^18",
+    "react-router-dom": "^6",        // клиентский роутинг (/, /reports, /reports/:id)
     "typescript": "^5",
     "vite": "^5",
     "@tanstack/react-query": "^5",   // серверное состояние
     "vega-lite": "^5",               // графики
-    "react-vega": "^7",
+    "vega-embed": "^6",              // рендер Vega-Lite спецификаций
     "zustand": "^4",                 // глобальный стор
-    "openapi-fetch": "^0.9",         // типобезопасный API клиент
-    "@radix-ui/react-*": "latest",   // Shadcn основа
+    "@radix-ui/react-*": "latest",   // UI-примитивы
     "tailwindcss": "^3",
     "class-variance-authority": "latest",
-    "lucide-react": "latest",
-    "react-pdf": "^7",               // превью PDF
-    "html2canvas": "^1",             // экспорт в PDF
-    "jspdf": "^2"
+    "lucide-react": "latest"
   }
 }
 ```
@@ -1309,7 +1327,7 @@ dependencies = [
 | `frontend` | `./frontend/Dockerfile` | 5173 (dev) / 80 (prod) | React + Vite |
 | `postgres` | `pgvector/pgvector:pg16` | 5432 | PostgreSQL с расширением pgvector |
 | `redis` | `redis:7-alpine` | 6379 | Blackboard pub/sub + кэш |
-| `ollama` | `ollama/ollama` | 11434 | LLaMA-модели (опционально, только если provider=ollama) |
+| `ollama` | `ollama/ollama` | 11434 | LLaMA-модели (опционально, только если `provider=ollama`; embedding-модели не загружаются) |
 | `nginx` | `nginx:alpine` | 80/443 | Reverse proxy (только prod) |
 
 ### `docker-compose.yml`
@@ -1740,6 +1758,7 @@ SESSION_TTL_HOURS=24
    - `POST /api/sessions` — создание сессии, запуск Оркестратора в фоне (`asyncio.create_task`)
    - `GET /api/sessions/{id}` — статус сессии + метаданные
 4. Создать `backend/app/api/routes/reports.py`:
+   - `GET /api/reports` — список завершённых отчётов (без авторизации)
    - `GET /api/reports/{session_id}` — полный `ReportSchema` (по завершении)
    - `GET /api/reports/{session_id}/stream` — SSE: события `block_approved`, `task_status`, `error`
 5. Настроить CORS для `localhost:5173`
@@ -1874,4 +1893,63 @@ SESSION_TTL_HOURS=24
 
 ---
 
-*Документ будет обновляться по мере разработки.*
+---
+
+## 17. Журнал архитектурных решений (ADR)
+
+### ADR-001 — Переход с Hybrid RAG (BM25 + pgvector) на BM25-only
+
+**Дата:** 2026-06-13  
+**Статус:** Принято
+
+**Контекст:**  
+Оригинальная архитектура использовала `sentence-transformers` (модель `BAAI/bge-m3`, 1024 измерений) для создания векторных эмбеддингов при загрузке каждого файла. Это требовало:
+- загрузки модели (~500 МБ) в память при старте backend'а
+- 5–30 секунд на батчевое embedding при загрузке документа
+- GPU для приемлемой скорости (на CPU — крайне медленно)
+
+**Решение:**  
+Удалены `sentence-transformers`, `keybert` и `spacy` из зависимостей. Retrieval переведён на **BM25-only** через `rank-bm25`. Поле `embedding` в БД оставлено nullable для возможного возврата.
+
+**Последствия:**
+- ✅ Загрузка документа: с ~20 с до <1 с
+- ✅ Startup time backend'а: с ~15 с до ~2 с
+- ✅ Нет зависимости от GPU / тяжёлых ML-библиотек
+- ⚠️ Ухудшение recall на парафразах и синонимах (~10–15% в типичных аналитических запросах)
+- ⚠️ KeyBERT заменён на частотный TF-анализ в `extract_keywords`
+
+---
+
+### ADR-002 — Добавление React Error Boundary для блоков
+
+**Дата:** 2026-06-13  
+**Статус:** Принято
+
+**Контекст:**  
+При рендере некорректной Vega-Lite спецификации или невалидных данных блока React выбрасывал uncaught exception, что приводило к размонтированию всего дерева компонентов — страница становилась белой.
+
+**Решение:**  
+Создан `BlockErrorBoundary` (класс-компонент с `componentDidCatch`). Каждый блок в `ReportCanvas` и `ReportViewer` обёрнут в `<BlockErrorBoundary>`.
+
+**Последствия:**
+- ✅ Сбой одного блока не влияет на остальные
+- ✅ Пользователь видит локальное сообщение об ошибке вместо белой страницы
+
+---
+
+### ADR-003 — Страницы просмотра отчётов без авторизации
+
+**Дата:** 2026-06-13  
+**Статус:** Принято
+
+**Контекст:**  
+Приложение не имело механизма просмотра ранее сгенерированных отчётов. После перезагрузки страницы или в новом браузере отчёты были недоступны.
+
+**Решение:**  
+- Добавлен эндпоинт `GET /api/reports` (список всех завершённых сессий)
+- Установлен `react-router-dom v6`, добавлены маршруты `/reports` и `/reports/:sessionId`
+- Страницы `ReportsList` и `ReportViewer` не требуют авторизации
+
+---
+
+*Документ актуален на 2026-06-13. Обновляется при каждом значимом архитектурном изменении.*
