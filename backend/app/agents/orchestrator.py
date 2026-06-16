@@ -1,18 +1,30 @@
 from __future__ import annotations
 import asyncio
+import math
 import time
 import uuid
 from datetime import datetime
 from typing import Any
+
+
+def _sanitize_json(obj: Any) -> Any:
+    """Recursively replace float NaN/Inf with None so PostgreSQL JSON accepts the payload."""
+    if isinstance(obj, float):
+        return None if (math.isnan(obj) or math.isinf(obj)) else obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_json(item) for item in obj]
+    return obj
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 
 from app.agents.base import BaseAgent
 from app.llm.provider import LLMMessage
-from app.llm.structured import llm
+from app.llm.structured import StructuredLLM, set_session_provider, set_session_llm, get_active_provider_name
 from app.blackboard.board import blackboard
-from app.schemas.tasks import TaskSpec, TaskGraph, OrchestratorPlan, DepartmentEnum, LoopGuard
+from app.schemas.tasks import TaskSpec, TaskGraph, OrchestratorPlan, LightOrchestratorPlan, DepartmentEnum, LoopGuard
 from app.schemas.report import ReportSchema, ReportMetadata, TOCEntry
 from app.schemas.blocks import ReportBlock
 from app.document_pipeline.retriever import retriever
@@ -32,10 +44,20 @@ class ChiefAgent(BaseAgent):
         session_id: str,
         query: str,
         file_ids: list[str],
+        llm_provider: str | None = None,
     ) -> None:
         """Main orchestration loop. Runs as a background task."""
+        # Set per-session provider — propagates to all workers via contextvars
+        if llm_provider:
+            set_session_provider(llm_provider)
+
+        # Fresh per-session token counter — shared with all workers via context var
+        llm = StructuredLLM()
+        set_session_llm(llm)   # workers call get_session_llm() → this instance
+
         start_time = time.time()
-        logger.info("orchestrator_start", session_id=session_id, files=len(file_ids))
+        logger.info("orchestrator_start", session_id=session_id,
+                    files=len(file_ids), provider=get_active_provider_name())
 
         await blackboard.init_session(session_id, query, file_ids)
 
@@ -52,7 +74,7 @@ class ChiefAgent(BaseAgent):
                 file_metas = await self._load_file_metadata(db, file_ids)
 
                 # 2. Plan tasks
-                plan = await self._plan(query, file_metas)
+                plan = await self._plan(query, file_metas, llm)
                 logger.info("plan_ready", tasks=len(plan.tasks), groups=len(plan.execution_order))
                 await blackboard.append_log(session_id, "plan_created", "ChiefAgent",
                     f"План составлен: {len(plan.tasks)} задач, {len(plan.execution_order)} групп выполнения",
@@ -88,23 +110,31 @@ class ChiefAgent(BaseAgent):
                 # 5. Assemble final report
                 await blackboard.append_log(session_id, "assembly_start", "AssemblyWorker",
                     f"Компиляция отчёта. Всего блоков для сборки: {len(all_blocks)}")
-                report = await self._assemble_report(session_id, query, all_blocks, file_ids, db)
+                report = await self._assemble_report(session_id, query, all_blocks, file_ids, db, llm)
 
                 # 6. Persist report blocks
                 await self._persist_report(db, session_id, report)
 
                 # 7. Persist agent log
                 elapsed = round(time.time() - start_time, 2)
-                full_log = await blackboard.get_log(session_id)
-                full_log.append({
-                    "ts": datetime.utcnow().isoformat(),
-                    "type": "session_complete",
-                    "agent": "ChiefAgent",
-                    "message": f"Сессия завершена. Время: {elapsed}с, токенов: {llm.total_tokens}, блоков: {len(all_blocks)}",
-                    "task_id": None, "department": None,
-                    "details": {"elapsed_s": elapsed, "total_tokens": llm.total_tokens,
-                                "blocks_count": len(all_blocks), "quality_score": report.metadata.quality_score},
-                })
+                await blackboard.append_log(
+                    session_id, "session_complete", "ChiefAgent",
+                    f"Анализ завершён за {elapsed}с. "
+                    f"Использовано токенов: {llm.total_tokens}. "
+                    f"Блоков сгенерировано: {len(all_blocks)}. "
+                    f"Качество: {report.metadata.quality_score:.0%}",
+                    details={
+                        "elapsed_s": elapsed,
+                        "total_tokens": llm.total_tokens,
+                        "blocks_count": len(all_blocks),
+                        "quality_score": report.metadata.quality_score,
+                        "departments_involved": report.metadata.departments_involved,
+                        "files_analyzed": report.metadata.files_analyzed,
+                        "llm_provider": report.metadata.llm_provider,
+                        "model_name": report.metadata.model_name,
+                    },
+                )
+                full_log = _sanitize_json(await blackboard.get_log(session_id))
                 await db.execute(
                     update(SessionDB).where(SessionDB.id == session_id).values(
                         status="complete",
@@ -122,7 +152,7 @@ class ChiefAgent(BaseAgent):
                 logger.error("orchestrator_error", session_id=session_id, error=str(e))
                 await blackboard.append_log(session_id, "session_error", "ChiefAgent",
                     f"Критическая ошибка: {str(e)[:300]}", details={"error": str(e)})
-                err_log = await blackboard.get_log(session_id)
+                err_log = _sanitize_json(await blackboard.get_log(session_id))
                 await db.execute(update(SessionDB).where(SessionDB.id == session_id).values(
                     status="failed", log_json=err_log
                 ))
@@ -144,52 +174,95 @@ class ChiefAgent(BaseAgent):
             for f in files
         ]
 
-    async def _plan(self, query: str, file_metas: list[dict]) -> OrchestratorPlan:
+    async def _plan(self, query: str, file_metas: list[dict], llm: StructuredLLM) -> OrchestratorPlan:
         files_summary = str(file_metas)[:500]
 
+        # ── Why this prompt uses LightOrchestratorPlan + worker role ──────────
+        # deepseek-reasoner expends 1 000–1 500 reasoning tokens before writing
+        # the actual JSON response, leaving only ~500–800 tokens for the plan
+        # when max_tokens=2000.  A full OrchestratorPlan with 5 tasks in
+        # TaskSpec format (~500 tok/task) needs ~2 500+ tokens — it always gets
+        # truncated, instructor cannot parse the incomplete JSON, and we fall
+        # back to _default_plan on every single session.
+        #
+        # Fix: use deepseek-chat (role="worker") which produces no reasoning
+        # overhead, and use LightOrchestratorPlan whose PlanTask has only
+        # 5 fields (~80 tok/task) instead of 15.  A 6-task plan fits in ~500
+        # output tokens.  We then inflate each PlanTask into a full TaskSpec.
+        # ─────────────────────────────────────────────────────────────────────
+
         system = """Ты ChiefAgent — оркестратор многоагентной системы генерации аналитических отчётов.
-Ты декомпозируешь аналитические задачи на атомарные подзадачи и распределяешь их по специализированным отделам.
+Декомпозируй аналитический запрос на атомарные подзадачи и распредели по отделам.
 
-КРИТИЧЕСКИ ВАЖНО: ВСЕ описания задач (description), рассуждения (reasoning) и любые текстовые поля
-в твоём ответе должны быть ИСКЛЮЧИТЕЛЬНО на РУССКОМ языке.
+ВАЖНО: все поля description и reasoning — строго на РУССКОМ языке.
 
-Доступные отделы:
-- data_extraction: Извлечение данных из документов, верификация чисел
-- quant_analysis: Статистический анализ, тренды, прогнозирование (математику выполняют инструменты, не LLM)
-- qual_analysis: Анализ текста, тональность, риски, резюмирование
-- visualization: Создание графиков и визуальных спецификаций
-- report_assembly: Компиляция финального отчёта с исполнительным резюме
+Доступные отделы (department):
+- data_extraction  — извлечение и верификация данных из документа
+- quant_analysis   — статистика, тренды, прогнозы (инструменты делают математику)
+- qual_analysis    — анализ текста, тональность, риски, резюме
+- visualization    — спецификации графиков и диаграмм
+- report_assembly  — финальный отчёт с исполнительным резюме
 
-Правила:
-1. Каждая задача должна быть атомарной с чётким ожидаемым результатом
-2. Группируй независимые задачи в параллельные группы execution_order
-3. data_extraction ДОЛЖЕН запускаться ДО quant_analysis или qual_analysis
-4. visualization запускается ПОСЛЕ quant_analysis
-5. report_assembly запускается ПОСЛЕДНИМ
-6. Описание задачи — не более 150 токенов, строго на русском
+Правила компоновки плана:
+1. data_extraction — всегда первым (группа 0)
+2. quant_analysis и qual_analysis — параллельно во второй группе, после data_extraction
+3. visualization — после quant_analysis (зависит от quant-задач)
+4. report_assembly — последним, зависит от всех остальных
+5. task_id — короткая строка без пробелов (напр. "extract_1", "quant_2")
+6. description — не длиннее 200 символов, строго на русском
+7. Не добавляй лишних задач — только те, что нужны для данного запроса
 
-Верни OrchestratorPlan JSON."""
+Верни LightOrchestratorPlan JSON."""
 
-        user = f"""Запрос пользователя: {query}
+        user = f"""Запрос: {query}
 
 Доступные файлы:
 {files_summary}
 
-Составь план выполнения с задачами и их группами параллельного выполнения."""
+Составь план: задачи и execution_order (список групп параллельного выполнения)."""
 
         try:
-            plan = await llm.complete(
-                messages=[LLMMessage(role="system", content=system), LLMMessage(role="user", content=user)],
-                response_model=OrchestratorPlan,
-                role="orchestrator",
-                max_tokens=2000,
+            light_plan = await llm.complete(
+                messages=[
+                    LLMMessage(role="system", content=system),
+                    LLMMessage(role="user",   content=user),
+                ],
+                response_model=LightOrchestratorPlan,
+                role="worker",        # → deepseek-chat: no reasoning overhead, great at JSON
+                max_tokens=4000,      # ample room: 6 PlanTasks ≈ 480 tokens
                 temperature=0.1,
             )
-            # Assign session_id to all tasks
-            for t in plan.tasks:
-                if not t.session_id:
-                    t.session_id = "pending"
-            return plan
+
+            # Validate execution_order references
+            valid_ids = {t.task_id for t in light_plan.tasks}
+            clean_order = [
+                [tid for tid in group if tid in valid_ids]
+                for group in light_plan.execution_order
+            ]
+            clean_order = [g for g in clean_order if g]
+            if not clean_order:
+                # Fallback: sequential order if LLM produced empty groups
+                clean_order = [[t.task_id] for t in light_plan.tasks]
+
+            # Inflate PlanTask → full TaskSpec
+            tasks = [
+                TaskSpec(
+                    task_id=t.task_id,
+                    session_id="pending",
+                    department=t.department,
+                    description=t.description,
+                    depends_on_tasks=t.depends_on_tasks,
+                    expected_output_type=t.expected_output_type,
+                )
+                for t in light_plan.tasks
+            ]
+
+            return OrchestratorPlan(
+                reasoning=light_plan.reasoning,
+                tasks=tasks,
+                execution_order=clean_order,
+            )
+
         except Exception as e:
             logger.warning("plan_failed_using_default", error=str(e))
             return self._default_plan(query)
@@ -251,10 +324,38 @@ class ChiefAgent(BaseAgent):
         await blackboard.append_log(task.session_id, "task_start",
             f"{dept.value.title().replace('_', '')}Worker",
             f"Задача запущена: «{task.description[:100]}»",
-            task_id=task.task_id, department=dept.value)
+            task_id=task.task_id, department=dept.value,
+            details={
+                "task_id": task.task_id,
+                "department": dept.value,
+                "description": task.description,
+                "max_retries": task.max_retries,
+                "max_tokens": task.max_tokens,
+                "file_ids": file_ids,
+            })
 
         # Retrieve relevant chunks
         chunks = await retriever.search(db, task.description, file_ids, top_k=8)
+        if chunks:
+            sources = list(dict.fromkeys(
+                c.get("filename") or c.get("source") or "документ"
+                for c in chunks if isinstance(c, dict)
+            ))
+            await blackboard.append_log(
+                task.session_id, "context_loaded",
+                f"{dept.value.title().replace('_', '')}Worker",
+                f"Контекст загружен: {len(chunks)} фрагментов из {len(sources)} источников",
+                task_id=task.task_id, department=dept.value,
+                details={
+                    "chunks_count": len(chunks),
+                    "sources": sources[:10],
+                    "top_chunk_preview": chunks[0].get("content", "")[:300] if chunks else "",
+                    "chunk_headers": [
+                        c.get("section_header") or c.get("chunk_type", "")
+                        for c in chunks[:8]
+                    ],
+                }
+            )
 
         # Load fingerprint from first file
         fingerprint_json = {}
@@ -328,7 +429,14 @@ class ChiefAgent(BaseAgent):
                         f"{dept.value.title().replace('_', '')}Critic",
                         f"✓ Одобрено (score={verdict.score:.2f}). Блоков: {len(blocks)}",
                         task_id=task.task_id, department=dept.value,
-                        details={"score": verdict.score, "blocks": [b.get("block_type") for b in blocks]})
+                        details={
+                            "score": verdict.score,
+                            "reasoning": verdict.reasoning,
+                            "blocks": [
+                                {"type": b.get("block_type"), "title": b.get("title", "")[:80]}
+                                for b in blocks
+                            ],
+                        })
                     # Publish approved blocks
                     for block in blocks:
                         block.setdefault("block_id", str(uuid.uuid4()))
@@ -351,8 +459,19 @@ class ChiefAgent(BaseAgent):
                     f"{dept.value.title().replace('_', '')}Critic",
                     f"✗ Отклонено (score={verdict.score:.2f}): {issues_summary}",
                     task_id=task.task_id, department=dept.value,
-                    details={"score": verdict.score, "issues": [{"sev": i.severity, "desc": i.description}
-                                                                  for i in verdict.issues]})
+                    details={
+                        "score": verdict.score,
+                        "reasoning": verdict.reasoning,
+                        "issues": [
+                            {
+                                "severity": i.severity,
+                                "category": i.category,
+                                "description": i.description,
+                                "suggested_fix": i.suggested_fix,
+                            }
+                            for i in verdict.issues
+                        ],
+                    })
                 if attempt < settings.max_task_retries:
                     logger.warning("task_rejected_retry", task_id=task.task_id, attempt=attempt, issues=len(verdict.issues))
                     await blackboard.increment_retry(task.task_id)
@@ -398,6 +517,7 @@ class ChiefAgent(BaseAgent):
         all_blocks: list[dict],
         file_ids: list[str],
         db: AsyncSession,
+        llm: StructuredLLM,
     ) -> ReportSchema:
         from app.agents.departments.report_assembly.worker import AssemblyWorker, AssemblyCritic
 
@@ -420,13 +540,16 @@ class ChiefAgent(BaseAgent):
         result = await db.execute(select(UploadedFile).where(UploadedFile.id.in_(file_ids)))
         files = result.scalars().all()
 
+        provider_name = get_active_provider_name()
+        model_name = (settings.ollama_worker_model if provider_name == "ollama"
+                      else settings.worker_model)
         metadata = ReportMetadata(
             total_tokens_used=llm.total_tokens,
             processing_time_seconds=0,
             departments_involved=list({b.get("created_by_dept", "") for b in final_blocks}),
             files_analyzed=[f.filename for f in files],
-            llm_provider=settings.llm_provider,
-            model_name=settings.worker_model,
+            llm_provider=provider_name,
+            model_name=model_name,
             quality_score=round(avg_score, 2),
             partial_blocks_count=partial_count,
         )

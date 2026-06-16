@@ -2,7 +2,7 @@ from __future__ import annotations
 import time
 from abc import ABC, abstractmethod
 from typing import Any
-from app.llm.structured import llm
+from app.llm.structured import get_session_llm, get_active_provider_name
 from app.llm.provider import LLMMessage
 from app.tools.registry import tool_registry
 from app.blackboard.board import blackboard
@@ -23,12 +23,13 @@ class BaseAgent(ABC):
         return f"You are {self.agent_name}, a specialized AI agent."
 
     def _get_model(self) -> str:
+        provider = get_active_provider_name()
         if self.role == "orchestrator":
-            model_key = settings.orchestrator_model if settings.llm_provider == "deepseek" else settings.ollama_orchestrator_model
+            model_key = settings.orchestrator_model if provider == "deepseek" else settings.ollama_orchestrator_model
         elif self.role == "critic":
-            model_key = settings.critic_model if settings.llm_provider == "deepseek" else settings.ollama_critic_model
+            model_key = settings.critic_model if provider == "deepseek" else settings.ollama_critic_model
         else:
-            model_key = settings.worker_model if settings.llm_provider == "deepseek" else settings.ollama_worker_model
+            model_key = settings.worker_model if provider == "deepseek" else settings.ollama_worker_model
         return model_key
 
     def _call_tool(self, tool_name: str, **kwargs) -> Any:
@@ -43,3 +44,24 @@ class BaseAgent(ABC):
 
     def _log(self, action: str, **kwargs) -> None:
         logger.info(action, agent=self.agent_name, department=self.department, **kwargs)
+
+    async def _bb_log(
+        self,
+        session_id: str,
+        event_type: str,
+        message: str,
+        *,
+        task_id: str | None = None,
+        department: str | None = None,
+        details: dict | None = None,
+    ) -> None:
+        """Emit a structured log event to the live SSE stream and persistent store."""
+        await blackboard.append_log(
+            session_id,
+            event_type,
+            self.agent_name,
+            message,
+            task_id=task_id,
+            department=department or self.department,
+            details=details,
+        )

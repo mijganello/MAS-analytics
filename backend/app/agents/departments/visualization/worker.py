@@ -2,7 +2,7 @@ from __future__ import annotations
 from pydantic import BaseModel
 from app.agents.base import BaseAgent
 from app.llm.provider import LLMMessage
-from app.llm.structured import llm
+from app.llm.structured import get_session_llm
 from app.schemas.tasks import CriticVerdict, CriticIssue, TaskSpec
 from app.tools.registry import tool_registry
 from app.core.logging import logger
@@ -20,8 +20,10 @@ class VizWorker(BaseAgent):
 
     async def run(self, task: TaskSpec, data_results: dict) -> list[dict]:
         self._log("worker_start", task_id=task.task_id)
+        dept_str = task.department.value if hasattr(task.department, "value") else str(task.department)
 
         # Use tool to suggest chart types
+        suggestion: dict = {}
         try:
             suggestion = tool_registry.call(
                 "suggest_chart_type",
@@ -31,6 +33,17 @@ class VizWorker(BaseAgent):
             primary_chart = suggestion.get("primary", "bar")
         except Exception:
             primary_chart = "bar"
+
+        await self._bb_log(
+            task.session_id, "tool_call",
+            f"Рекомендован тип графика: {primary_chart}. Источников данных: {len(data_results)}",
+            task_id=task.task_id, department=dept_str,
+            details={
+                "chart_suggestion": suggestion,
+                "data_sources": list(data_results.keys())[:10],
+                "primary_chart_type": primary_chart,
+            },
+        )
 
         # Generate Vega-Lite specs via tools
         chart_blocks = []
@@ -88,7 +101,7 @@ class VizWorker(BaseAgent):
 Создай 1-3 блока с графиками. Каждый vega_lite_spec.data.values должен содержать числа из данных выше."""
 
             try:
-                output = await llm.complete(
+                output = await get_session_llm().complete(
                     messages=[LLMMessage(role="system", content=system), LLMMessage(role="user", content=user)],
                     response_model=VizWorkerOutput, role="worker", max_tokens=2000,
                 )
@@ -97,6 +110,18 @@ class VizWorker(BaseAgent):
                 logger.error("viz_llm_failed", error=str(e))
 
         self._log("worker_done", task_id=task.task_id, blocks=len(chart_blocks))
+
+        await self._bb_log(
+            task.session_id, "llm_response",
+            f"Визуализация завершена: {len(chart_blocks)} график(ов)",
+            task_id=task.task_id, department=dept_str,
+            details={
+                "charts_count": len(chart_blocks),
+                "chart_titles": [b.get("title", "")[:60] for b in chart_blocks],
+                "chart_types": [b.get("chart_type") for b in chart_blocks],
+            },
+        )
+
         return chart_blocks
 
 

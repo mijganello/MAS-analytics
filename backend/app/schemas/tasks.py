@@ -81,11 +81,40 @@ class CriticVerdict(BaseModel):
     reasoning: str = Field(default="", max_length=300)
 
 
+class PlanTask(BaseModel):
+    """
+    Lightweight task description used only during the planning phase.
+
+    Contains only the 5 fields the LLM actually needs to produce.
+    Avoids sending ~15-field TaskSpec JSON which overwhelms the token budget
+    when deepseek-reasoner spends 1 000+ tokens on chain-of-thought reasoning
+    before the actual JSON output.  Converted to full TaskSpec after planning.
+    """
+    task_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    department: DepartmentEnum
+    description: str = Field(max_length=300)
+    depends_on_tasks: list[str] = []
+    expected_output_type: str = "text"
+
+
 class OrchestratorPlan(BaseModel):
     reasoning: str = Field(max_length=500)
     tasks: list[TaskSpec]
     execution_order: list[list[str]]      # группы параллельных задач
     estimated_total_tokens: int = 0
+
+
+class LightOrchestratorPlan(BaseModel):
+    """
+    Slim plan returned by the LLM planner (uses PlanTask, not full TaskSpec).
+
+    JSON footprint per task: ~80 tokens vs ~500 tokens for TaskSpec.
+    For a 6-task plan this reduces the response from ~3 000 to ~500 tokens,
+    making the call reliable even within a 2 000-token output budget.
+    """
+    reasoning: str = Field(max_length=500)
+    tasks: list[PlanTask]
+    execution_order: list[list[str]]
 
 
 class TaskGraph(BaseModel):

@@ -2,7 +2,7 @@ from __future__ import annotations
 from pydantic import BaseModel
 from app.agents.base import BaseAgent
 from app.llm.provider import LLMMessage
-from app.llm.structured import llm
+from app.llm.structured import get_session_llm
 from app.schemas.tasks import CriticVerdict, CriticIssue, TaskSpec
 from app.tools.registry import tool_registry
 from app.core.logging import logger
@@ -20,6 +20,7 @@ class QualWorker(BaseAgent):
 
     async def run(self, task: TaskSpec, chunks: list[dict]) -> list[dict]:
         self._log("worker_start", task_id=task.task_id)
+        dept_str = task.department.value if hasattr(task.department, "value") else str(task.department)
         context = self._build_context_from_chunks(chunks)
 
         # Run NLP tools first
@@ -46,6 +47,31 @@ class QualWorker(BaseAgent):
         except Exception:
             pass
 
+        if nlp_results:
+            sentiment = nlp_results.get("sentiment", {})
+            keywords = nlp_results.get("keywords", {})
+            risks = nlp_results.get("risks", {})
+            sentiment_label = (
+                sentiment.get("overall_sentiment") or
+                (sentiment[0].get("label") if isinstance(sentiment, list) and sentiment else "н/д")
+            )
+            kw_list = keywords.get("keywords", keywords) if isinstance(keywords, dict) else keywords
+            await self._bb_log(
+                task.session_id, "nlp_analysis",
+                f"NLP: тональность={sentiment_label}, "
+                f"ключевых слов={len(kw_list) if isinstance(kw_list, list) else '?'}, "
+                f"рисков={len(risks.get('risks', [])) if isinstance(risks, dict) else '?'}",
+                task_id=task.task_id, department=dept_str,
+                details={
+                    "sentiment": sentiment,
+                    "keywords": kw_list[:15] if isinstance(kw_list, list) else kw_list,
+                    "extractive_summary": nlp_results.get("summary", ""),
+                    "risks": risks,
+                    "text_length_chars": len(full_text),
+                    "chunks_analyzed": len(chunks),
+                },
+            )
+
         system = """Ты QualWorker — агент качественного анализа. Создавай блоки отчёта на основе результатов NLP-инструментов.
 Доступные типы блоков: "text" и "insight". НЕ используй risk_matrix.
 НЕ анализируй текст повторно — используй только предоставленные результаты NLP.
@@ -68,13 +94,26 @@ class QualWorker(BaseAgent):
 Создай блоки отчёта. У каждого должно быть поле block_type. Весь текст — на русском."""
 
         try:
-            output = await llm.complete(
+            output = await get_session_llm().complete(
                 messages=[LLMMessage(role="system", content=system), LLMMessage(role="user", content=user)],
                 response_model=QualWorkerOutput,
                 role="worker",
                 max_tokens=2000,
             )
             self._log("worker_done", task_id=task.task_id, blocks=len(output.blocks))
+
+            await self._bb_log(
+                task.session_id, "llm_response",
+                f"Качественный анализ завершён: {len(output.blocks)} блоков",
+                task_id=task.task_id, department=dept_str,
+                details={
+                    "blocks_count": len(output.blocks),
+                    "block_types": [b.get("block_type") for b in output.blocks],
+                    "block_titles": [b.get("title", "")[:60] for b in output.blocks],
+                    "reasoning": output.reasoning[:500] if output.reasoning else "",
+                },
+            )
+
             return output.blocks
         except Exception as e:
             logger.error("qual_worker_failed", error=str(e))

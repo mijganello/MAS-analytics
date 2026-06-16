@@ -4,7 +4,7 @@ from typing import Any
 from pydantic import BaseModel
 from app.agents.base import BaseAgent
 from app.llm.provider import LLMMessage
-from app.llm.structured import llm
+from app.llm.structured import get_session_llm
 from app.schemas.tasks import CriticVerdict, CriticIssue, TaskSpec
 from app.tools.registry import tool_registry
 from app.core.logging import logger
@@ -49,11 +49,25 @@ class QuantWorker(BaseAgent):
 
     async def run(self, task: TaskSpec, chunks: list[dict], data_context: dict) -> list[dict]:
         self._log("worker_start", task_id=task.task_id)
+        dept_str = task.department.value if hasattr(task.department, "value") else str(task.department)
         context = self._build_context_from_chunks(chunks)
 
         # ── Step 1: Pre-extract numeric series deterministically ──────────────
         numeric_series = _extract_numeric_series(chunks)
         logger.info("numeric_series_extracted", task_id=task.task_id, series=list(numeric_series.keys()))
+
+        await self._bb_log(
+            task.session_id, "tool_call",
+            f"Извлечено числовых рядов: {len(numeric_series)} — {', '.join(list(numeric_series.keys())[:6]) or 'нет данных'}",
+            task_id=task.task_id, department=dept_str,
+            details={
+                "numeric_series": {
+                    name: {"count": len(vals), "values": vals[:10]}
+                    for name, vals in list(numeric_series.items())[:8]
+                },
+                "chunks_analyzed": len(chunks),
+            },
+        )
 
         # ── Step 2: Run math tools directly on extracted data ─────────────────
         calc_results: dict[str, Any] = {}
@@ -104,6 +118,19 @@ class QuantWorker(BaseAgent):
             except Exception as e:
                 logger.warning("outlier_tool_failed", error=str(e))
 
+        if calc_results:
+            await self._bb_log(
+                task.session_id, "tool_call",
+                f"Математические инструменты: выполнено {len(calc_results)} вычислений",
+                task_id=task.task_id, department=dept_str,
+                details={
+                    "calculations": {
+                        k: (v if isinstance(v, dict) else str(v))
+                        for k, v in list(calc_results.items())[:10]
+                    },
+                },
+            )
+
         # ── Step 3: LLM interprets tool results → creates blocks ──────────────
         class BlocksOutput(BaseModel):
             blocks: list[dict]
@@ -133,13 +160,27 @@ class QuantWorker(BaseAgent):
 Весь текст — на русском языке."""
 
         try:
-            output = await llm.complete(
+            output = await get_session_llm().complete(
                 messages=[LLMMessage(role="system", content=system), LLMMessage(role="user", content=user)],
                 response_model=BlocksOutput,
                 role="worker",
                 max_tokens=2000,
             )
             self._log("worker_done", task_id=task.task_id, blocks=len(output.blocks))
+
+            await self._bb_log(
+                task.session_id, "llm_response",
+                f"Количественный анализ завершён: {len(output.blocks)} блоков",
+                task_id=task.task_id, department=dept_str,
+                details={
+                    "blocks_count": len(output.blocks),
+                    "block_types": [b.get("block_type") for b in output.blocks],
+                    "block_titles": [b.get("title", "")[:60] for b in output.blocks],
+                    "reasoning": output.reasoning[:500] if output.reasoning else "",
+                    "series_used": list(numeric_series.keys()),
+                },
+            )
+
             return output.blocks
         except Exception as e:
             logger.error("quant_blocks_failed", error=str(e))

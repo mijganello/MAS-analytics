@@ -2,7 +2,7 @@ from __future__ import annotations
 from pydantic import BaseModel
 from app.agents.base import BaseAgent
 from app.llm.provider import LLMMessage
-from app.llm.structured import llm
+from app.llm.structured import get_session_llm
 from app.schemas.tasks import CriticVerdict, TaskSpec
 from app.schemas.report import ReportSchema, ReportMetadata, TOCEntry
 from app.core.logging import logger
@@ -24,6 +24,7 @@ class AssemblyWorker(BaseAgent):
 
     async def run(self, task: TaskSpec, all_blocks: list[dict]) -> dict:
         self._log("worker_start", task_id=task.task_id)
+        dept_str = task.department.value if hasattr(task.department, "value") else str(task.department)
 
         # Order blocks logically without LLM
         type_order = {
@@ -69,7 +70,7 @@ class AssemblyWorker(BaseAgent):
 Сгенерируй исполнительное резюме на русском языке."""
 
         try:
-            summary_result = await llm.complete(
+            summary_result = await get_session_llm().complete(
                 messages=[LLMMessage(role="system", content=system), LLMMessage(role="user", content=user)],
                 response_model=SummaryOutput, role="worker", max_tokens=800,
             )
@@ -119,6 +120,24 @@ class AssemblyWorker(BaseAgent):
             b["order"] = i
 
         self._log("worker_done", task_id=task.task_id, total_blocks=len(final_blocks))
+
+        await self._bb_log(
+            task.session_id, "llm_response",
+            f"Отчёт скомпилирован: {len(final_blocks)} блоков. "
+            f"Ключевых выводов: {len(exec_summary.get('key_findings', []))}",
+            task_id=task.task_id, department=dept_str,
+            details={
+                "total_blocks": len(final_blocks),
+                "block_order": [
+                    {"type": b.get("block_type"), "title": b.get("title", "")[:60]}
+                    for b in final_blocks
+                ],
+                "key_findings": exec_summary.get("key_findings", []),
+                "recommendations": exec_summary.get("recommendations", []),
+                "overall_conclusion": exec_summary.get("overall_conclusion", "")[:400],
+            },
+        )
+
         return {"blocks": final_blocks, "toc": toc}
 
 
