@@ -10,7 +10,7 @@ export const ExecutiveSummaryComponent: React.FC<ExecutiveSummaryBlock> = ({
   const score = typeof report_quality_score === 'number' ? report_quality_score : 0
 
   return (
-    <div className="rounded-xl border bg-gradient-to-br from-primary/5 to-background p-6 space-y-5">
+    <div className="rounded-2xl border bg-gradient-to-br from-primary/8 to-card p-6 space-y-5">
       <div className="flex items-center justify-between">
         <h3 className="text-lg font-bold text-foreground">Исполнительное резюме</h3>
         {score > 0 && (

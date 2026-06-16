@@ -22,7 +22,7 @@ export const ComparisonBlockComponent: React.FC<ComparisonBlock> = ({
           {safeItems.map((item, i) => (
             <div
               key={i}
-              className={`rounded-lg border p-4 space-y-2 ${
+              className={`rounded-xl border p-4 space-y-2 ${
                 item.label === winner ? 'border-primary ring-1 ring-primary bg-primary/5' : ''
               }`}
             >

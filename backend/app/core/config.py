@@ -26,10 +26,11 @@ class Settings(BaseSettings):
     critic_model: str = "deepseek-chat"
     embedding_model: str = "BAAI/bge-m3"
 
-    # LLaMA models (when provider=ollama)
-    ollama_orchestrator_model: str = "llama3.3:70b"
-    ollama_worker_model: str = "llama3.1:8b"
-    ollama_critic_model: str = "llama3.1:8b"
+    # Local Ollama models — qwen2.5 is recommended: good at Russian, JSON, structured output
+    # Override via OLLAMA_WORKER_MODEL etc. in .env if you have more VRAM
+    ollama_orchestrator_model: str = "qwen2.5:7b"
+    ollama_worker_model: str = "qwen2.5:7b"
+    ollama_critic_model: str = "qwen2.5:7b"
     ollama_embedding_model: str = "nomic-embed-text"
 
     # Limits

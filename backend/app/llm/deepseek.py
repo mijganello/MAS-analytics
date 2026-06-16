@@ -32,7 +32,7 @@ class DeepSeekProvider(LLMProvider):
             messages=msgs,
             max_tokens=max_tokens,
             temperature=temperature,
-            max_retries=2,
+            max_retries=0,
         )
         return result
 

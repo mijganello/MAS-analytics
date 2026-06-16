@@ -12,15 +12,15 @@ const icons: Record<string, React.ElementType> = {
 }
 
 const severityStyles: Record<string, string> = {
-  info: 'border-blue-200 bg-blue-50 dark:border-blue-800 dark:bg-blue-950/30',
-  warning: 'border-amber-200 bg-amber-50 dark:border-amber-800 dark:bg-amber-950/30',
-  critical: 'border-red-200 bg-red-50 dark:border-red-800 dark:bg-red-950/30',
+  info: 'border-blue-500 bg-blue-100 dark:border-blue-600 dark:bg-blue-950/50',
+  warning: 'border-amber-500 bg-amber-100 dark:border-amber-600 dark:bg-amber-950/50',
+  critical: 'border-red-600 bg-red-100 dark:border-red-700 dark:bg-red-950/50',
 }
 
 const iconColors: Record<string, string> = {
-  info: 'text-blue-600',
-  warning: 'text-amber-600',
-  critical: 'text-red-600',
+  info: 'text-blue-800',
+  warning: 'text-amber-800',
+  critical: 'text-red-800',
 }
 
 export const InsightBlockComponent: React.FC<InsightBlock> = ({
@@ -31,7 +31,7 @@ export const InsightBlockComponent: React.FC<InsightBlock> = ({
   const safeConfidence = typeof confidence === 'number' ? confidence : null
 
   return (
-    <div className={cn('rounded-xl border p-4 space-y-2', severityStyles[safeSeverity])}>
+    <div className={cn('rounded-2xl border p-4 space-y-2', severityStyles[safeSeverity])}>
       <div className="flex items-start gap-3">
         <Icon className={cn('h-5 w-5 flex-shrink-0 mt-0.5', iconColors[safeSeverity])} />
         <div className="flex-1 min-w-0">

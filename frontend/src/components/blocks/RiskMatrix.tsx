@@ -3,9 +3,9 @@ import type { RiskMatrixBlock, RiskItem } from '@/types/blocks'
 import { cn } from '@/lib/utils'
 
 const levelColor: Record<string, string> = {
-  low: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300',
-  medium: 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300',
-  high: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300',
+  low: 'bg-emerald-100 text-emerald-900 border border-emerald-400 dark:bg-emerald-900/40 dark:text-emerald-200',
+  medium: 'bg-amber-100 text-amber-900 border border-amber-500 dark:bg-amber-900/40 dark:text-amber-200',
+  high: 'bg-red-100 text-red-900 border border-red-500 dark:bg-red-900/40 dark:text-red-200',
 }
 
 const levelLabel: Record<string, string> = {
@@ -15,10 +15,10 @@ const levelLabel: Record<string, string> = {
 }
 
 const overallColor: Record<string, string> = {
-  low: 'text-emerald-600',
-  medium: 'text-amber-600',
-  high: 'text-red-600',
-  critical: 'text-red-700 font-bold',
+  low: 'text-emerald-800',
+  medium: 'text-amber-800',
+  high: 'text-red-800',
+  critical: 'text-red-900 font-bold',
 }
 
 const overallLabel: Record<string, string> = {
@@ -59,7 +59,7 @@ export const RiskMatrixBlockComponent: React.FC<RiskMatrixBlock> = ({
       ) : (
         <div className="space-y-3">
           {safeRisks.map((risk, i) => (
-            <div key={i} className="rounded-lg border p-4 space-y-2">
+            <div key={i} className="rounded-xl border p-4 space-y-2">
               <div className="flex items-start justify-between gap-2">
                 <h4 className="font-medium text-foreground text-sm">{risk.name ?? '—'}</h4>
                 <div className="flex gap-2 flex-shrink-0 items-center">
@@ -73,7 +73,7 @@ export const RiskMatrixBlockComponent: React.FC<RiskMatrixBlock> = ({
                 <p className="text-xs text-muted-foreground">{risk.description}</p>
               )}
               {risk.mitigation && (
-                <p className="text-xs text-emerald-700 dark:text-emerald-400">
+                <p className="text-xs text-emerald-800 dark:text-emerald-300 font-medium">
                   ✓ Митигация: {risk.mitigation}
                 </p>
               )}

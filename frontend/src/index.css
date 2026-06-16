@@ -2,52 +2,93 @@
 @tailwind components;
 @tailwind utilities;
 
-@layer base {
-  :root {
-    --background: 0 0% 100%;
-    --foreground: 222.2 84% 4.9%;
-    --card: 0 0% 100%;
-    --card-foreground: 222.2 84% 4.9%;
-    --popover: 0 0% 100%;
-    --popover-foreground: 222.2 84% 4.9%;
-    --primary: 221.2 83.2% 53.3%;
-    --primary-foreground: 210 40% 98%;
-    --secondary: 210 40% 96.1%;
-    --secondary-foreground: 222.2 47.4% 11.2%;
-    --muted: 210 40% 96.1%;
-    --muted-foreground: 215.4 16.3% 46.9%;
-    --accent: 210 40% 96.1%;
-    --accent-foreground: 222.2 47.4% 11.2%;
-    --destructive: 0 84.2% 60.2%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 214.3 31.8% 91.4%;
-    --input: 214.3 31.8% 91.4%;
-    --ring: 221.2 83.2% 53.3%;
-    --radius: 0.5rem;
-  }
-
-  .dark {
-    --background: 222.2 84% 4.9%;
-    --foreground: 210 40% 98%;
-    --card: 222.2 84% 4.9%;
-    --card-foreground: 210 40% 98%;
-    --primary: 217.2 91.2% 59.8%;
-    --primary-foreground: 222.2 47.4% 11.2%;
-    --secondary: 217.2 32.6% 17.5%;
-    --secondary-foreground: 210 40% 98%;
-    --muted: 217.2 32.6% 17.5%;
-    --muted-foreground: 215 20.2% 65.1%;
-    --accent: 217.2 32.6% 17.5%;
-    --accent-foreground: 210 40% 98%;
-    --destructive: 0 62.8% 30.6%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 217.2 32.6% 17.5%;
-    --input: 217.2 32.6% 17.5%;
-    --ring: 224.3 76.3% 48%;
-  }
+@layer utilities {
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+  .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
 }
 
 @layer base {
+  /* ── Тема «Светлая» (ГОСТ Р 50948 / 55062) ─────────────────────────────
+     Голубовато-серая основа. Контраст текст/фон ≥ 8:1 (WCAG AAA).
+  ─────────────────────────────────────────────────────────────────────── */
+  :root {
+    --background: 214 38% 91%;         /* #DDE6F2 — голубовато-серый фон        */
+    --foreground: 216 70% 7%;          /* #060D1A — почти чёрный ≥ 15:1         */
+    --card: 214 45% 97%;               /* #EFF5FD — лёгкий голубой тон карточек */
+    --card-foreground: 216 70% 7%;
+    --popover: 214 45% 97%;
+    --popover-foreground: 216 70% 7%;
+    --primary: 214 100% 27%;           /* #003C8A — ГОСТ-синий                  */
+    --primary-foreground: 0 0% 100%;
+    --secondary: 214 30% 85%;
+    --secondary-foreground: 216 70% 7%;
+    --muted: 214 35% 86%;              /* #CCDAEB — панели и сайдбар            */
+    --muted-foreground: 215 60% 20%;   /* #0F2D4E — ≥ 8:1 на любом фоне        */
+    --accent: 214 50% 80%;
+    --accent-foreground: 216 70% 7%;
+    --destructive: 0 100% 36%;         /* #B80000 — ГОСТ-сигнальный красный     */
+    --destructive-foreground: 0 0% 100%;
+    --border: 214 28% 72%;             /* #9AB3CC — видимая граница             */
+    --input: 214 28% 72%;
+    --ring: 214 100% 27%;
+    --radius: 0.75rem;
+  }
+
+  /* ── Тема «Тёмная» ───────────────────────────────────────────────────── */
+  .dark {
+    --background: 216 55% 10%;
+    --foreground: 215 38% 92%;
+    --card: 216 48% 14%;
+    --card-foreground: 215 38% 92%;
+    --popover: 216 48% 14%;
+    --popover-foreground: 215 38% 92%;
+    --primary: 214 85% 55%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 215 40% 22%;
+    --secondary-foreground: 215 38% 92%;
+    --muted: 215 42% 18%;
+    --muted-foreground: 215 35% 65%;
+    --accent: 215 40% 22%;
+    --accent-foreground: 215 38% 92%;
+    --destructive: 0 90% 50%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 215 35% 28%;
+    --input: 215 35% 28%;
+    --ring: 214 85% 55%;
+  }
+
+  /* ── Тема «Доступность» (вдохновлена 1С:Предприятие) ───────────────────
+     Тёплая серо-бежевая гамма. Укрупнённый шрифт (18 px), межстрочный
+     интервал 1.65. Контраст текст/фон ≥ 10:1 (WCAG AAA).
+     Оптимальна для людей со сниженным зрением и презентаций.
+  ─────────────────────────────────────────────────────────────────────── */
+  .projector {
+    /* Шрифт: 18 px на html-элементе → все rem/em масштабируются */
+    font-size: 18px;
+    line-height: 1.65;
+
+    --background: 34 18% 81%;          /* #D5CEC6 — тёплый серо-бежевый, 1С-классика */
+    --foreground: 22 55% 7%;           /* #180F07 — глубокий тёмно-коричневый ≥ 12:1 */
+    --card: 35 16% 93%;                /* #EEEBE6 — светло-бежевые карточки          */
+    --card-foreground: 22 55% 7%;
+    --popover: 35 16% 93%;
+    --popover-foreground: 22 55% 7%;
+    --primary: 215 72% 28%;            /* #134285 — 1С-синий, стоит на бежевом       */
+    --primary-foreground: 0 0% 100%;
+    --secondary: 34 18% 72%;           /* #C3BBB1 — вторичный тёплый серый           */
+    --secondary-foreground: 22 55% 7%;
+    --muted: 34 18% 72%;               /* #C3BBB1 — сайдбар и панели                 */
+    --muted-foreground: 22 50% 12%;    /* #281509 — читаемый тёмный, ≥ 10:1          */
+    --accent: 215 60% 35%;             /* #215598 — акцентный синий                  */
+    --accent-foreground: 0 0% 100%;
+    --destructive: 0 88% 34%;          /* #A70000 — красный сигнальный               */
+    --destructive-foreground: 0 0% 100%;
+    --border: 34 18% 58%;              /* #A39890 — тёплая видимая граница           */
+    --input: 34 18% 58%;
+    --ring: 215 72% 28%;
+    --radius: 0.875rem;                /* чуть больше радиус для крупных элементов  */
+  }
+
   * {
     @apply border-border;
   }

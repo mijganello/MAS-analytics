@@ -15,7 +15,7 @@ export const KPICardComponent: React.FC<KPICard> = ({
     : 'text-muted-foreground'
 
   return (
-    <div className="rounded-xl border bg-card p-5 shadow-sm flex flex-col h-full">
+    <div className="rounded-2xl border bg-card p-5 shadow-sm flex flex-col h-full">
       <div className="flex items-start justify-between gap-2">
         <p className="text-sm font-medium text-muted-foreground leading-snug">{metric_name ?? 'Показатель'}</p>
         <div className="flex-shrink-0 mt-0.5">

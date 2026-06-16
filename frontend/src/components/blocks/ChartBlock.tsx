@@ -11,16 +11,16 @@ import {
 import type { ChartBlock } from '@/types/blocks'
 import { cn } from '@/lib/utils'
 
-// ── Colour palette ────────────────────────────────────────────────────────────
+// ── Colour palette (ГОСТ Р 50948 — насыщенные цвета для засвеченных помещений)
 const PALETTE = [
-  '#6366f1', // indigo-500
-  '#22c55e', // green-500
-  '#f59e0b', // amber-500
-  '#ef4444', // red-500
-  '#3b82f6', // blue-500
-  '#a855f7', // purple-500
-  '#14b8a6', // teal-500
-  '#f97316', // orange-500
+  '#003C8A', // ГОСТ-синий (primary)
+  '#C00000', // ГОСТ-сигнальный красный
+  '#1A6B1A', // Тёмно-зелёный (успех/рост)
+  '#D45800', // Тёмно-оранжевый (внимание)
+  '#5B1A8C', // Тёмно-фиолетовый
+  '#006B5B', // Тёмно-бирюзовый
+  '#7B3500', // Коричневый
+  '#0D4F8C', // Средний синий
 ]
 
 // ── Vega-Lite spec parser ─────────────────────────────────────────────────────
@@ -118,7 +118,7 @@ function formatVal(v: unknown): string {
   return String(v ?? '')
 }
 
-const axisStyle = { fontSize: 11, fill: '#94a3b8' }
+const axisStyle = { fontSize: 12, fill: '#0F2D4E', fontWeight: 600 }
 
 // ── Chart renderers ───────────────────────────────────────────────────────────
 
@@ -138,11 +138,11 @@ const BarChartRenderer: React.FC<{ parsed: ParsedChart }> = ({ parsed }) => {
     )
     return (
       <BarChart data={pivoted} margin={{ top: 4, right: 8, bottom: 24, left: 8 }}>
-        <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
+        <CartesianGrid strokeDasharray="3 3" stroke="#7A9BBE" vertical={false} />
         <XAxis dataKey={xField} tick={axisStyle} tickLine={false} axisLine={false} />
         <YAxis tick={axisStyle} tickLine={false} axisLine={false} tickFormatter={v => formatVal(v)} />
-        <Tooltip content={<CustomTooltip />} cursor={{ fill: '#f1f5f9' }} />
-        <Legend wrapperStyle={{ fontSize: 11, paddingTop: 8 }} />
+        <Tooltip content={<CustomTooltip />} cursor={{ fill: '#BDD0EC' }} />
+        <Legend wrapperStyle={{ fontSize: 12, paddingTop: 8, fontWeight: 500 }} />
         {series.map((s, i) => (
           <Bar key={s} dataKey={s} fill={PALETTE[i % PALETTE.length]} radius={[4, 4, 0, 0]} maxBarSize={48} />
         ))}
@@ -152,10 +152,10 @@ const BarChartRenderer: React.FC<{ parsed: ParsedChart }> = ({ parsed }) => {
 
   return (
     <BarChart data={data} margin={{ top: 4, right: 8, bottom: 24, left: 8 }}>
-      <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
+      <CartesianGrid strokeDasharray="3 3" stroke="#7A9BBE" vertical={false} />
       <XAxis dataKey={xField} tick={axisStyle} tickLine={false} axisLine={false} />
       <YAxis tick={axisStyle} tickLine={false} axisLine={false} tickFormatter={v => formatVal(v)} />
-      <Tooltip content={<CustomTooltip />} cursor={{ fill: '#f1f5f9' }} />
+      <Tooltip content={<CustomTooltip />} cursor={{ fill: '#BDD0EC' }} />
       <Bar dataKey={yField} fill={PALETTE[0]} radius={[4, 4, 0, 0]} maxBarSize={56}>
         {data.map((_, i) => (
           <Cell key={i} fill={PALETTE[i % PALETTE.length]} />
@@ -179,14 +179,14 @@ const LineChartRenderer: React.FC<{ parsed: ParsedChart }> = ({ parsed }) => {
     )
     return (
       <LineChart data={pivoted} margin={{ top: 4, right: 8, bottom: 24, left: 8 }}>
-        <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
+        <CartesianGrid strokeDasharray="3 3" stroke="#7A9BBE" vertical={false} />
         <XAxis dataKey={xField} tick={axisStyle} tickLine={false} axisLine={false} />
         <YAxis tick={axisStyle} tickLine={false} axisLine={false} tickFormatter={v => formatVal(v)} />
         <Tooltip content={<CustomTooltip />} />
-        <Legend wrapperStyle={{ fontSize: 11, paddingTop: 8 }} />
+        <Legend wrapperStyle={{ fontSize: 12, paddingTop: 8, fontWeight: 500 }} />
         {series.map((s, i) => (
           <Line key={s} type="monotone" dataKey={s} stroke={PALETTE[i % PALETTE.length]}
-            strokeWidth={2} dot={{ r: 3 }} activeDot={{ r: 5 }} />
+            strokeWidth={2.5} dot={{ r: 4 }} activeDot={{ r: 6 }} />
         ))}
       </LineChart>
     )
@@ -194,12 +194,12 @@ const LineChartRenderer: React.FC<{ parsed: ParsedChart }> = ({ parsed }) => {
 
   return (
     <LineChart data={data} margin={{ top: 4, right: 8, bottom: 24, left: 8 }}>
-      <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
+      <CartesianGrid strokeDasharray="3 3" stroke="#7A9BBE" vertical={false} />
       <XAxis dataKey={xField} tick={axisStyle} tickLine={false} axisLine={false} />
       <YAxis tick={axisStyle} tickLine={false} axisLine={false} tickFormatter={v => formatVal(v)} />
       <Tooltip content={<CustomTooltip />} />
       <Line type="monotone" dataKey={yField} stroke={PALETTE[0]}
-        strokeWidth={2.5} dot={{ r: 3, fill: PALETTE[0] }} activeDot={{ r: 5 }} />
+        strokeWidth={3} dot={{ r: 4, fill: PALETTE[0] }} activeDot={{ r: 6 }} />
     </LineChart>
   )
 }
@@ -221,19 +221,19 @@ const AreaChartRenderer: React.FC<{ parsed: ParsedChart }> = ({ parsed }) => {
         <defs>
           {series.map((s, i) => (
             <linearGradient key={s} id={`grad-${i}`} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="5%" stopColor={PALETTE[i % PALETTE.length]} stopOpacity={0.3} />
-              <stop offset="95%" stopColor={PALETTE[i % PALETTE.length]} stopOpacity={0.02} />
+              <stop offset="5%" stopColor={PALETTE[i % PALETTE.length]} stopOpacity={0.4} />
+              <stop offset="95%" stopColor={PALETTE[i % PALETTE.length]} stopOpacity={0.05} />
             </linearGradient>
           ))}
         </defs>
-        <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
+        <CartesianGrid strokeDasharray="3 3" stroke="#7A9BBE" vertical={false} />
         <XAxis dataKey={xField} tick={axisStyle} tickLine={false} axisLine={false} />
         <YAxis tick={axisStyle} tickLine={false} axisLine={false} tickFormatter={v => formatVal(v)} />
         <Tooltip content={<CustomTooltip />} />
-        <Legend wrapperStyle={{ fontSize: 11, paddingTop: 8 }} />
+        <Legend wrapperStyle={{ fontSize: 12, paddingTop: 8, fontWeight: 500 }} />
         {series.map((s, i) => (
           <Area key={s} type="monotone" dataKey={s} stroke={PALETTE[i % PALETTE.length]}
-            fill={`url(#grad-${i})`} strokeWidth={2} />
+            fill={`url(#grad-${i})`} strokeWidth={2.5} />
         ))}
       </AreaChart>
     )
@@ -243,16 +243,16 @@ const AreaChartRenderer: React.FC<{ parsed: ParsedChart }> = ({ parsed }) => {
     <AreaChart data={data} margin={{ top: 4, right: 8, bottom: 24, left: 8 }}>
       <defs>
         <linearGradient id="grad-0" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="5%" stopColor={PALETTE[0]} stopOpacity={0.3} />
-          <stop offset="95%" stopColor={PALETTE[0]} stopOpacity={0.02} />
+          <stop offset="5%" stopColor={PALETTE[0]} stopOpacity={0.4} />
+          <stop offset="95%" stopColor={PALETTE[0]} stopOpacity={0.05} />
         </linearGradient>
       </defs>
-      <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
+      <CartesianGrid strokeDasharray="3 3" stroke="#7A9BBE" vertical={false} />
       <XAxis dataKey={xField} tick={axisStyle} tickLine={false} axisLine={false} />
       <YAxis tick={axisStyle} tickLine={false} axisLine={false} tickFormatter={v => formatVal(v)} />
       <Tooltip content={<CustomTooltip />} />
       <Area type="monotone" dataKey={yField} stroke={PALETTE[0]}
-        fill="url(#grad-0)" strokeWidth={2.5} dot={{ r: 3 }} activeDot={{ r: 5 }} />
+        fill="url(#grad-0)" strokeWidth={3} dot={{ r: 4 }} activeDot={{ r: 6 }} />
     </AreaChart>
   )
 }
@@ -288,7 +288,7 @@ const PieChartRenderer: React.FC<{ parsed: ParsedChart }> = ({ parsed }) => {
       </Pie>
       <Tooltip content={<CustomTooltip />} />
       <Legend
-        formatter={(value) => <span style={{ fontSize: 11, color: '#64748b' }}>{value}</span>}
+            formatter={(value) => <span style={{ fontSize: 12, color: '#0F2D4E', fontWeight: 600 }}>{value}</span>}
       />
     </PieChart>
   )
@@ -330,7 +330,7 @@ export const ChartBlockComponent: React.FC<ChartBlock> = ({
   const chartTitle = title || (parsed?.title as string | undefined)
 
   return (
-    <div className="rounded-xl border bg-card p-5 shadow-sm space-y-3">
+    <div className="rounded-2xl border bg-card p-5 shadow-sm space-y-3">
       {chartTitle && (
         <h3 className="font-semibold text-foreground text-sm">{chartTitle}</h3>
       )}

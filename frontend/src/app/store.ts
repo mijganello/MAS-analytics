@@ -30,6 +30,8 @@ interface AppState {
   // Task statuses
   taskStatuses: TaskStatusEvent[]
   upsertTask: (t: TaskStatusEvent) => void
+  resetTasks: () => void
+  completeAllTasks: () => void
 
   // Agent log (live, from SSE)
   logEvents: LogEvent[]
@@ -71,6 +73,14 @@ export const useStore = create<AppState>((set) => ({
     }
     return { taskStatuses: [...s.taskStatuses, t] }
   }),
+  resetTasks: () => set({ taskStatuses: [] }),
+  completeAllTasks: () => set((s) => ({
+    taskStatuses: s.taskStatuses.map(t =>
+      (t.status === 'running' || t.status === 'review')
+        ? { ...t, status: 'approved' }
+        : t
+    ),
+  })),
 
   logEvents: [],
   appendLogEvent: (e) => set((s) => ({ logEvents: [...s.logEvents, e] })),

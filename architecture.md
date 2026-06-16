@@ -105,23 +105,25 @@
 Blackboard — центральное разделяемое хранилище состояния, через которое агенты взаимодействуют **без прямых вызовов друг друга**. Реализована на Redis (production) или `asyncio`-словаре (dev/test).
 
 ```
-Blackboard
-├── session:{id}
-│   ├── user_query          # исходный запрос
-│   ├── uploaded_files[]    # мета + чанки
-│   ├── task_graph          # DAG задач
-│   │   ├── tasks[{id, dept, status, ttl, retries, result}]
-│   │   └── edges[]         # зависимости задач
-│   ├── intermediate[]      # результаты выполненных задач
-│   ├── report_blocks[]     # накопленные блоки отчёта (Pydantic)
-│   ├── messages[]          # лог сообщений агентов
-│   └── audit_log[]         # трассировка для воспроизводимости
+Blackboard (пространства ключей Redis / asyncio-словарь)
+├── session:{id}                    # метаданные сессии (query, file_ids, status)
+├── graph:{id}                      # TaskGraph (снимок плана, записывается один раз)
+│   ├── tasks: dict[task_id → TaskSpec]
+│   └── execution_groups: list[list[str]]   # уровни параллелизма (без edges)
+├── task:{task_id}                  # TaskSpec отдельной задачи
+├── task_status:{task_id}           # статус + счётчик ретраев
+├── draft:{task_id}                 # черновик блока (опционально)
+├── verdict:{task_id}               # CriticVerdict (опционально)
+├── block:{block_id}                # одобренный блок отчёта
+├── session_blocks:{id}             # список block_id текущей сессии
+└── agentlog:{id}                   # структурированный лог событий агентов
 ```
 
 **Ключевые свойства:**
-- Атомарные операции записи (Redis WATCH / optimistic locking)
-- TTL на каждую задачу и на весь сеанс
-- Подписка агентов на изменения через pub/sub (Redis) или `asyncio.Event`
+- Двойной режим: Redis (production) / `asyncio`-словарь + in-process pub/sub (dev/test); переключение автоматическое при старте
+- TTL на каждый ключ (по умолчанию 24 ч для блоков, `task_timeout * 10` для задач)
+- Pub/sub через `broker.publish / broker.subscribe` — события транслируются как SSE фронтенду
+- Оркестратор не подписывается на события Blackboard — он управляет выполнением через прямые вызовы и `asyncio.gather`
 
 ---
 
@@ -129,32 +131,41 @@ Blackboard
 
 **Единственная роль:** планирование и маршрутизация. Оркестратор **никогда не выполняет** аналитику сам.
 
-**Доступные инструменты оркестратора:**
-- `inspect_document_metadata(file_id)` — типы данных, структура, размер, таблицы
-- `get_data_summary(file_id)` — статистический слепок без полного чтения
-- `decompose_task(query, doc_meta)` → `TaskGraph` — строит DAG задач
-- `assign_task(task_id, dept_id)` — размещает задачу на доске
-- `read_blackboard(keys)` — читает результаты отделов
-- `compile_final_report(block_ids[])` → `ReportSchema` — финальная сборка
+**Алгоритм работы (`ChiefAgent.run`):**
 
-**Логика планирования (Chain-of-Thought в ограниченном формате):**
+1. Загрузить метаданные файлов из PostgreSQL (имена, типы, размеры, структуру — но **не содержимое**).
+2. Вызвать `_plan(query, file_metas)` — сформировать системный и пользовательский промпт, отправить LLM, получить `OrchestratorPlan` через structured output (`instructor`).
+3. Конвертировать план в `TaskGraph` и записать на Blackboard (однократно, как снимок состояния).
+4. Последовательно выполнить группы `execution_order`: каждая группа — `asyncio.gather` параллельных задач.
+5. После всех групп вызвать `AssemblyWorker` для финальной компиляции отчёта.
+6. Сохранить блоки в PostgreSQL и пометить сессию как завершённую.
+
+**Планирование через structured LLM output (декомпозиция без отдельного инструмента):**
 
 ```python
 class OrchestratorPlan(BaseModel):
-    reasoning: str           # до 300 токенов — краткое рассуждение
-    tasks: list[TaskSpec]    # атомарные задачи
-    execution_order: list[list[str]]  # параллельные группы задач
+    reasoning: str                    # краткое обоснование плана (≤500 токенов)
+    tasks: list[TaskSpec]             # атомарные задачи
+    execution_order: list[list[str]]  # группы параллельных задач (топологические уровни)
+    estimated_total_tokens: int = 0
 
 class TaskSpec(BaseModel):
     task_id: str
+    session_id: str
     department: DepartmentEnum
-    description: str         # до 150 токенов
-    required_inputs: list[str]  # ссылки на doc_id или task_id
-    expected_output_type: ReportBlockType
-    priority: int
+    description: str                  # ≤500 символов
+    required_inputs: list[str] = []   # file_ids или task_ids
+    depends_on_tasks: list[str] = []  # метаданные зависимостей (не валидируются runtime)
+    expected_output_type: str = "text"
+    priority: int = 5
     max_retries: int = 2
     timeout_seconds: int = 120
+    max_tokens: int = 8000
+    escalation_policy: EscalationPolicy = EscalationPolicy()
+    context_hints: dict[str, Any] = {}
 ```
+
+> **Важно:** зависимости между задачами задаются **порядком групп** в `execution_order`, а не рёбрами графа. Поле `depends_on_tasks` в `TaskSpec` — информационное; runtime не проверяет его при запуске задачи. `TaskGraph` записывается на Blackboard один раз при старте сессии и далее не обновляется.
 
 **Стратегия токен-экономии оркестратора:**  
 Оркестратор работает только с метаданными документов (не с полным содержимым), а его системный промпт содержит только описания типов задач и отделов — без примеров данных.
@@ -221,30 +232,35 @@ class CriticIssue(BaseModel):
 
 ### 3.4 Протокол взаимодействия агентов
 
-Все коммуникации идут **исключительно** через Blackboard. Прямых вызовов между агентами нет.
+Оркестратор является **централизованным диспетчером**: Worker и Critic одного отдела вызываются им **синхронно и напрямую** внутри метода `_execute_task()`. Blackboard при этом используется для публикации событий (через pub/sub) и ведения лога — но не как управляющий канал между агентами.
 
 ```
-Оркестратор → пишет TaskSpec → Blackboard
-Blackboard → уведомляет Worker через pub/sub → Worker читает TaskSpec
-Worker → вызывает Tools → получает детерминированные результаты
-Worker → формирует черновик блока → пишет в Blackboard
-Blackboard → уведомляет Critic → Critic читает черновик
-Critic → пишет CriticVerdict → Blackboard
-Blackboard → если REJECT и retries > 0 → уведомляет Worker (с причиной)
-Blackboard → если APPROVED → уведомляет Оркестратора
-Оркестратор → проверяет граф задач → назначает следующие задачи
+Оркестратор → asyncio.gather(группа задач)
+  └── _execute_task(task)
+        ├── Blackboard.update_task_status → pub/sub: TASK_ASSIGNED
+        ├── retriever.search() → релевантные чанки из БД
+        ├── Worker.run(task, chunks) → list[dict блоков]
+        ├── Critic.review(task_id, blocks) → CriticVerdict
+        ├── если APPROVED:
+        │     Blackboard.write_approved_block() → pub/sub: BLOCK_APPROVED (→ SSE фронтенду)
+        └── если REJECT и попытки не исчерпаны → повтор Worker → Critic
+              иначе → блоки публикуются со статусом "partial"
 ```
 
-**Сообщение на доске** (минимальный формат для экономии памяти):
+**Прямых peer-to-peer вызовов между агентами нет.** Worker не подписывается на Blackboard и не «слышит» события — оркестратор вызывает его явно. Blackboard публикует события для двух потребителей: фронтенда (через SSE) и отладочного лога сессии.
+
+**Модель сообщения** (используется для SSE и внутреннего аудита, но не как транспорт между Worker и Critic):
 
 ```python
 class BlackboardMessage(BaseModel):
     msg_id: str
     from_agent: str
     to_agent: str | None        # None = broadcast
+    session_id: str
     task_id: str
-    msg_type: Literal["TASK_ASSIGNED", "DRAFT_READY", "VERDICT", "ESCALATION", "DONE"]
-    payload_ref: str            # ссылка на объект, а не сам объект
+    msg_type: BlackboardEventType   # TASK_ASSIGNED | DRAFT_READY | VERDICT | ESCALATION | BLOCK_APPROVED | SESSION_DONE
+    payload_ref: str            # ключ в Redis / id объекта (ссылка, не сам объект)
+    payload: dict[str, Any] = {}   # лёгкий payload для фронтенда
     timestamp: datetime
     ttl_seconds: int = 3600
 ```
@@ -253,34 +269,44 @@ class BlackboardMessage(BaseModel):
 
 ### 3.5 Механизм предотвращения бесконечных циклов
 
-**Многоуровневая защита:**
+**Схемы защиты** (определены в `schemas/tasks.py`):
 
 ```python
 class LoopGuard(BaseModel):
     task_id: str
-    max_retries: int = 2          # Critic может отправить задачу обратно не более N раз
+    max_retries: int = 2          # Critic может вернуть задачу не более N раз
     current_retries: int = 0
-    max_total_tokens: int = 8000  # жёсткий лимит токенов на задачу
+    max_total_tokens: int = 8000  # информационный лимит токенов на задачу
     tokens_used: int = 0
-    timeout_seconds: int = 120    # жёсткий дедлайн
+    timeout_seconds: int = 120    # информационный дедлайн
     started_at: datetime
     escalation_policy: EscalationPolicy
+    draft_scores: list[float] = []   # оценки черновиков для use_best_draft
+    draft_ids: list[str] = []
 
 class EscalationPolicy(BaseModel):
-    on_retry_exhausted: Literal["USE_BEST_DRAFT", "SKIP_BLOCK", "FAIL_TASK"]
-    on_timeout: Literal["USE_BEST_DRAFT", "SKIP_BLOCK", "FAIL_TASK"]
-    on_token_limit: Literal["USE_BEST_DRAFT", "TRUNCATE_AND_FINALIZE"]
+    on_retry_exhausted: Literal["use_best_draft", "skip_block", "fail_task"] = "use_best_draft"
+    on_timeout: Literal["use_best_draft", "skip_block", "fail_task"] = "use_best_draft"
+    on_token_limit: Literal["use_best_draft", "truncate_and_finalize"] = "use_best_draft"
     notify_orchestrator: bool = True
 ```
 
-**Алгоритм:**
-1. При каждом цикле Worker↔Critic счётчик `current_retries` увеличивается
-2. При `current_retries >= max_retries` → `EscalationPolicy.on_retry_exhausted`
-3. `USE_BEST_DRAFT` — из всех черновиков выбирается тот, у которого наивысший `score` от Critic
-4. `SKIP_BLOCK` — блок помечается как `PARTIAL`, в отчёте выводится предупреждение
-5. Оркестратор получает уведомление `ESCALATION` и корректирует граф задач
+**Фактический алгоритм (реализован в `_execute_task`):**
 
-**Дополнительно:** дедупликация сообщений по хэшу `(task_id, payload_hash)` предотвращает зацикливание в pub/sub.
+1. Счётчик попыток управляется через `settings.max_task_retries` и переменную `attempt` цикла `for attempt in range(max_retries + 1)`.
+2. При каждом `REJECT` от Critic — `Blackboard.increment_retry(task_id)` и переход к следующей итерации.
+3. После исчерпания попыток последние полученные блоки публикуются на Blackboard со статусом `"partial"` и флагом предупреждения — это реализация стратегии `use_best_draft`.
+4. Задача получает статус `"escalated"` в Blackboard; оркестратор **не перестраивает план** — он продолжает выполнение оставшихся групп.
+
+> **Примечание:** поля `tokens_used`, `draft_scores` и `draft_ids` в `LoopGuard` определены в схеме, но оркестратором активно не заполняются — управление повторами основано на счётчике попыток.
+
+**Статусы задачи в жизненном цикле:**
+
+```
+PENDING → RUNNING → (APPROVED | ESCALATED | FAILED)
+```
+
+При `REJECT` статус не меняется — задача остаётся в `RUNNING` до следующего вердикта или эскалации.
 
 ---
 
@@ -1730,15 +1756,15 @@ SESSION_TTL_HOURS=24
 
 **Задачи:**
 1. Создать `backend/app/agents/orchestrator.py` — `ChiefAgent`:
-   - `plan(session_id, query, file_ids)` → `OrchestratorPlan` (через `deepseek-reasoner` / `llama3.3:70b`)
-   - `decompose()` → `TaskGraph` DAG с параллельными группами
-   - `execute_graph()` — цикл: получить группу задач → запустить параллельно → дождаться → следующая группа
-   - `on_task_complete(task_id, block)` — обновление графа, проверка зависимостей
-   - `on_task_escalated(task_id)` — применение EscalationPolicy
-   - `finalize(session_id)` → `ReportSchema` через `report_assembly` отдел
-2. Реализовать параллельное выполнение задач через `asyncio.TaskGroup`
-3. Реализовать зависимости задач — задача не стартует пока не готовы `required_inputs`
-4. Реализовать передачу результатов зависимостей: Task B получает краткую сводку результата Task A (не полный блок, экономия токенов)
+   - `run(session_id, query, file_ids)` — главный метод; запускается как фоновая задача FastAPI
+   - `_plan(query, file_metas)` → `OrchestratorPlan` (structured LLM output через `deepseek-reasoner` / `llama3.3:70b`); при сбое — `_default_plan()`
+   - `_execute_group(session_id, task_ids, ...)` → `list[dict]` — параллельное выполнение через `asyncio.gather`
+   - `_execute_task(task, file_ids, db, existing_blocks)` → `list[dict]` — цикл Worker → Critic с retry до `settings.max_task_retries`
+   - `_assemble_report(session_id, query, all_blocks, ...)` → `ReportSchema` — вызов `AssemblyWorker`
+   - `_persist_report(db, session_id, report)` — сохранение блоков в PostgreSQL
+2. Зависимости задач задаются **порядком групп** в `execution_order` — задачи следующей группы стартуют только после завершения текущей
+3. Передача контекста между группами: накопленный список `all_blocks` передаётся каждому `_execute_task` как `existing_blocks` для доступа к результатам предыдущих отделов
+4. Реализовать резервный план `_default_plan()` на случай сбоя LLM при планировании
 
 **Критерий готовности:** на тестовом сценарии (CSV-файл + запрос «проанализируй продажи») Оркестратор создаёт корректный граф из 4–6 задач, часть выполняется параллельно, итоговый `ReportSchema` содержит ≥3 разных типа блоков.
 

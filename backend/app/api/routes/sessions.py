@@ -47,18 +47,22 @@ async def create_session(
     await db.commit()
 
     # Run orchestrator in background
-    background_tasks.add_task(_run_orchestrator, session_id, request.query, request.file_ids)
+    background_tasks.add_task(
+        _run_orchestrator, session_id, request.query, request.file_ids, request.llm_provider
+    )
 
     logger.info("session_created", session_id=session_id, files=len(files))
     return CreateSessionResponse(session_id=session_id, status="pending")
 
 
-async def _run_orchestrator(session_id: str, query: str, file_ids: list[str]) -> None:
+async def _run_orchestrator(
+    session_id: str, query: str, file_ids: list[str], llm_provider: str | None = None
+) -> None:
     # Wait for file processing
     await asyncio.sleep(2)
     from app.agents.orchestrator import chief_agent
     try:
-        await chief_agent.run(session_id, query, file_ids)
+        await chief_agent.run(session_id, query, file_ids, llm_provider=llm_provider)
     except Exception as e:
         logger.error("orchestrator_background_error", session_id=session_id, error=str(e))
 

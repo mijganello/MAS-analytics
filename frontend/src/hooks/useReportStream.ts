@@ -5,7 +5,7 @@ import type { ReportBlock, TaskStatusEvent } from '@/types/blocks'
 import type { LogEvent } from '@/app/store'
 
 export function useReportStream(sessionId: string | null) {
-  const { addBlock, upsertTask, setGenerating, appendLogEvent } = useStore()
+  const { addBlock, upsertTask, setGenerating, appendLogEvent, completeAllTasks } = useStore()
   const esRef = useRef<EventSource | null>(null)
 
   useEffect(() => {
@@ -33,6 +33,7 @@ export function useReportStream(sessionId: string | null) {
             details: event.details,
           } as LogEvent)
         } else if (event.type === 'session_done') {
+          completeAllTasks()
           setGenerating(false)
           es.close()
         }

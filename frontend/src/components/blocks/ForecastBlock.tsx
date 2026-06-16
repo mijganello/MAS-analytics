@@ -38,7 +38,7 @@ export const ForecastBlockComponent: React.FC<ForecastBlock> = ({
           y: { field: 'value', type: 'quantitative', title: metric_name ?? 'Значение' },
           color: {
             field: 'type', type: 'nominal',
-            scale: { domain: ['Исторические данные', 'Прогноз'], range: ['#3b82f6', '#f59e0b'] },
+            scale: { domain: ['Исторические данные', 'Прогноз'], range: ['#003C8A', '#D45800'] },
             title: 'Тип',
           },
           tooltip: [{ field: 'period', title: 'Период' }, { field: 'value', format: ',.2f', title: 'Значение' }],
@@ -46,7 +46,7 @@ export const ForecastBlockComponent: React.FC<ForecastBlock> = ({
       },
       ...(forecastData.length > 0 ? [{
         data: { values: forecastData },
-        mark: { type: 'area', opacity: 0.2, color: '#f59e0b' },
+        mark: { type: 'area', opacity: 0.25, color: '#D45800' },
         encoding: {
           x: { field: 'period', type: 'ordinal' },
           y: { field: 'lower', type: 'quantitative' },

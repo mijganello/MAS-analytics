@@ -23,6 +23,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      ollama:
+        condition: service_healthy
     restart: unless-stopped
     networks:
       - mas_network
@@ -78,13 +80,36 @@ services:
 
   ollama:
     image: ollama/ollama
-    profiles: ["ollama"]
     ports:
       - "11434:11434"
     volumes:
       - ollama_models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
     networks:
       - mas_network
+
+  # Pulls required models once on startup, then exits
+  ollama-init:
+    image: ollama/ollama
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+        OLLAMA_HOST=http://ollama:11434 ollama pull qwen2.5:7b &&
+        OLLAMA_HOST=http://ollama:11434 ollama pull nomic-embed-text &&
+        echo 'All models ready.'
+      "
+    volumes:
+      - ollama_models:/root/.ollama
+    networks:
+      - mas_network
+    restart: "no"
 
 volumes:
   postgres_data:
