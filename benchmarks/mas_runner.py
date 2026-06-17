@@ -41,8 +41,69 @@ def _mime_type(path: Path) -> str:
     }.get(path.suffix.lower(), "application/octet-stream")
 
 
+def _row_to_str(row: object) -> str:
+    """Serialize a table row to a pipe-delimited string of its *values*.
+
+    Blocks store rows as dicts {col_key: value}.  The old code iterated
+    ``for c in row`` which yields dict keys (strings), losing all numeric
+    values and making NPI always 0 for table-heavy reports.
+    """
+    if isinstance(row, dict):
+        return " | ".join(str(v) for v in row.values())
+    # list/tuple row — original behaviour
+    return " | ".join(str(c) for c in row)
+
+
+def _kpi_value_str(value: object) -> str:
+    """Normalise a KPI card value so that _extract_numbers can find it.
+
+    The worker model stores ``value`` as a string (e.g. "15 200 000",
+    "15,200,000", "3.17", "₽14 066", "85%").  We strip non-numeric
+    decoration and keep the raw number so downstream regex can pick it up.
+
+    We intentionally return the *raw number string*, not a reformatted
+    float, so that _is_precise() sees the original precision.
+    """
+    if isinstance(value, (int, float)):
+        return str(value)
+    s = str(value).strip()
+    # Strip currency/percent/unit prefix/suffix characters
+    s = s.replace("₽", "").replace("$", "").replace("€", "").replace("%", "")
+    s = s.replace("руб", "").replace("тыс", "").replace("млн", "").replace("млрд", "")
+    # Collapse comma-as-thousands: "15,200,000" → "15200000"
+    # Rule: if pattern is X,YYY,ZZZ (multiple comma-separated 3-digit groups) → thousands
+    import re as _re
+    s = _re.sub(r'(\d),(\d{3})(?=,\d{3}|\b)', r'\1\2', s)  # multi-group
+    s = _re.sub(r'(\d),(\d{3})\b', r'\1\2', s)             # single group
+    # K/M/B/тыс/млн suffixes → raw integer string
+    # Must run after comma-strip so "15,2К" works too
+    suffix_map = [
+        (_re.compile(r'^([+-]?\d+(?:[.,]\d+)?)\s*[Kк]$'), 1_000),
+        (_re.compile(r'^([+-]?\d+(?:[.,]\d+)?)\s*[Мм]$'), 1_000_000),
+        (_re.compile(r'^([+-]?\d+(?:[.,]\d+)?)\s*[Bb]$'), 1_000_000_000),
+    ]
+    for pat, mult in suffix_map:
+        m = pat.match(s.strip())
+        if m:
+            try:
+                num = float(m.group(1).replace(',', '.')) * mult
+                return str(int(num) if num == int(num) else num)
+            except ValueError:
+                pass
+    return s.strip()
+
+
 def extract_report_text(blocks: list[dict]) -> str:
-    """Concatenate meaningful text from all report blocks."""
+    """Concatenate meaningful text from all report blocks.
+
+    Produces a plain-text representation that both HI (hallucination) and
+    NPI (numeric precision) metrics can consume.  Key correctness rules:
+
+    - Table rows are stored as dicts {col_key: value}; we emit values, not keys.
+    - KPI ``value`` fields are normalised (thousand separators stripped, K/M
+      suffixes expanded) so the NPI regex can detect large exact numbers.
+    - Forecast / comparison / chart numeric payloads are included.
+    """
     parts: list[str] = []
 
     for block in blocks:
@@ -52,53 +113,111 @@ def extract_report_text(blocks: list[dict]) -> str:
             parts.append(block.get("content", ""))
 
         elif bt == "kpi_card":
-            title = block.get("title", "")
-            value = block.get("value", "")
-            unit  = block.get("unit", "")
-            parts.append(f"{title}: {value} {unit}".strip())
+            title  = block.get("title", "") or block.get("metric_name", "")
+            value  = block.get("value", "")
+            unit   = block.get("unit", "")
+            norm   = _kpi_value_str(value)
+            parts.append(f"{title}: {norm} {unit}".strip())
+            # Also include delta/benchmark if present
+            for extra_key in ("delta", "delta_pct", "benchmark"):
+                v = block.get(extra_key)
+                if v is not None:
+                    parts.append(f"{extra_key}: {v}")
 
         elif bt == "table":
+            parts.append(block.get("title", ""))
             parts.append(block.get("caption", ""))
+            columns = block.get("columns", [])
             headers = block.get("headers", [])
-            rows    = block.get("rows", [])
+            # columns is a list of dicts {"key":..., "label":...}; extract labels
+            if columns and isinstance(columns[0], dict):
+                headers = [c.get("label", c.get("key", "")) for c in columns]
             if headers:
                 parts.append(" | ".join(str(h) for h in headers))
-            for row in rows[:100]:
-                parts.append(" | ".join(str(c) for c in row))
+            rows = block.get("rows", [])
+            for row in rows[:200]:
+                parts.append(_row_to_str(row))
+            # totals row
+            totals = block.get("totals_row")
+            if totals:
+                parts.append(_row_to_str(totals))
 
         elif bt == "insight":
-            parts.append(block.get("text", ""))
+            parts.append(block.get("headline", ""))
+            parts.append(block.get("explanation", ""))
+            parts.append(block.get("text", ""))   # legacy field
+            for sd in block.get("supporting_data", []):
+                parts.append(str(sd))
 
         elif bt == "executive_summary":
+            parts.append(block.get("overall_conclusion", ""))
             parts.append(block.get("content", ""))
+            for finding in block.get("key_findings", []):
+                parts.append(str(finding))
+            for rec in block.get("recommendations", []):
+                parts.append(str(rec))
 
         elif bt == "comparison":
             parts.append(block.get("title", ""))
-            items = block.get("items", [])
-            parts.append(json.dumps(items, ensure_ascii=False))
+            parts.append(block.get("analysis", ""))
+            for item in block.get("items", []):
+                if isinstance(item, dict):
+                    parts.append(item.get("label", ""))
+                    metrics = item.get("metrics", {})
+                    if isinstance(metrics, dict):
+                        for k, v in metrics.items():
+                            parts.append(f"{k}: {v}")
+                else:
+                    parts.append(str(item))
 
         elif bt == "forecast":
             parts.append(block.get("title", ""))
             parts.append(block.get("summary", ""))
-            for pt in block.get("data_points", [])[:20]:
+            parts.append(block.get("metric_name", ""))
+            for pt in block.get("historical", [])[:20]:
+                if isinstance(pt, dict):
+                    parts.append(f"{pt.get('period','')}: {pt.get('value','')}")
+                else:
+                    parts.append(str(pt))
+            for pt in block.get("forecast", [])[:10]:
+                if isinstance(pt, dict):
+                    parts.append(
+                        f"{pt.get('period','')}: {pt.get('value','')} "
+                        f"[{pt.get('lower_bound','')}-{pt.get('upper_bound','')}]"
+                    )
+                else:
+                    parts.append(str(pt))
+            for pt in block.get("data_points", [])[:20]:   # legacy field
                 parts.append(str(pt))
 
         elif bt == "risk_matrix":
             parts.append(block.get("title", ""))
             for risk in block.get("risks", []):
-                name  = risk.get("name", "")
-                descr = risk.get("description", "")
-                parts.append(f"{name}: {descr}")
+                if isinstance(risk, dict):
+                    parts.append(
+                        f"{risk.get('name','')}: {risk.get('description','')}"
+                    )
 
         elif bt == "chart":
             parts.append(block.get("title", ""))
             parts.append(block.get("description", ""))
+            parts.append(block.get("caption", ""))
+            # Try to extract numeric values from vega-lite data payload
+            spec = block.get("vega_lite_spec", {})
+            if isinstance(spec, dict):
+                data = spec.get("data", {})
+                if isinstance(data, dict):
+                    for item in data.get("values", [])[:50]:
+                        if isinstance(item, dict):
+                            parts.append(_row_to_str(item))
 
         else:
-            # Generic fallback: grab all non-trivial string values
+            # Generic fallback: grab all non-trivial string/numeric values
             for v in block.values():
                 if isinstance(v, str) and len(v) > 5:
                     parts.append(v)
+                elif isinstance(v, (int, float)) and not isinstance(v, bool):
+                    parts.append(str(v))
 
     return "\n".join(p for p in parts if p.strip())
 

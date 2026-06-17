@@ -27,10 +27,57 @@ from typing import Any
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _extract_numbers(text: str) -> list[float]:
-    """Extract all numeric values ≥ 2 from text (Russian and standard formats)."""
-    text = re.sub(r'(\d)\s+(\d)', r'\1\2', text)          # "1 000 000" → "1000000"
-    text = re.sub(r'(\d)\xa0(\d)', r'\1\2', text)          # non-breaking space
-    raw  = re.findall(r'\d+(?:[.,]\d+)?', text)
+    """Extract all numeric values ≥ 2 from text (Russian and standard formats).
+
+    Handles:
+    - Space / non-breaking-space thousand separators: "1 000 000" → 1000000
+    - Comma-as-thousands (unambiguous groups): "15,200,000" → 15200000
+      (only when multiple comma-separated 3-digit groups, i.e. classic US thousands)
+    - Single comma-separated 3-digit group: "15,200" → 15200 only when
+      the pattern is unambiguous (not "3,14" which is European decimal)
+    - Decimal comma for single-decimal values: "3,14" → 3.14
+    - K / М / M / тыс / млн suffixes: "15.2К" → 15200, "1.5М" → 1500000
+    """
+    # 1. Non-breaking and hair spaces → regular space for uniform treatment
+    text = text.replace('\xa0', ' ').replace('\u202f', ' ')
+
+    # 2. Space-separated thousands: "1 200 345" → "1200345"
+    #    Require exactly 3 digits after each space to avoid joining "5 кг" etc.
+    text = re.sub(r'(\d) (\d{3})(?!\d)', r'\1\2', text)
+    text = re.sub(r'(\d) (\d{3})(?!\d)', r'\1\2', text)   # second pass for 9-digit+ numbers
+
+    # 3. Expand K / M / B / тыс / млн / млрд suffixes before comma stripping
+    def _expand_suffix(m: re.Match) -> str:
+        num_s  = m.group(1).replace(',', '.')
+        suffix = m.group(2).lower()
+        mult   = {
+            'k': 1_000, 'к': 1_000,
+            'тыс': 1_000,
+            'м': 1_000_000, 'm': 1_000_000,
+            'млн': 1_000_000,
+            'b': 1_000_000_000, 'млрд': 1_000_000_000,
+        }.get(suffix, 1)
+        try:
+            v = float(num_s) * mult
+            return str(int(v) if v == int(v) else v)
+        except ValueError:
+            return m.group(0)
+
+    text = re.sub(
+        r'(\d+(?:[.,]\d+)?)\s*(млрд|млн|тыс|[KкМмBb])\b',
+        _expand_suffix, text, flags=re.IGNORECASE,
+    )
+
+    # 4. Comma thousand separators: "15,200,000" or "15,200"
+    #    Multi-group (unambiguous): 1+ leading digit + ,DDD + ,DDD … → strip commas
+    text = re.sub(r'(\d{1,3})(,\d{3}){2,}', lambda m: m.group(0).replace(',', ''), text)
+    #    Single group: X,YYY where YYY is 3 digits and NOT followed by a digit → thousands
+    #    But "3,14" (2 digits after comma) is a decimal → don't touch
+    text = re.sub(r'(\d{1,3}),(\d{3})(?!\d)', r'\1\2', text)
+
+    # 5. Now extract: integers or decimal-point floats only
+    #    (commas that remain are treated as decimal separator: "3,14" → "3.14")
+    raw = re.findall(r'\d+(?:[.,]\d+)?', text)
     nums: list[float] = []
     for r in raw:
         try:

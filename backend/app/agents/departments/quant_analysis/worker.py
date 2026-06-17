@@ -10,29 +10,101 @@ from app.tools.registry import tool_registry
 from app.core.logging import logger
 
 
-def _extract_numeric_series(chunks: list[dict]) -> dict[str, list[float]]:
-    """Pre-extract named numeric series from chunks without LLM."""
-    series: dict[str, list[float]] = {}
+def _is_timestamp(value: str) -> bool:
+    """Return True for ISO-like timestamps (2025-01-01, 2024-12-31T…)."""
+    return bool(re.match(r'^\d{4}-\d{2}-\d{2}', value.strip()))
+
+
+def _try_float(s: str) -> float | None:
+    """Parse a cell value as float; return None on failure."""
+    s = s.strip()
+    if not s or s in ('-', 'n/a', 'null', 'none', '—', 'н/а'):
+        return None
+    try:
+        return float(s.replace(',', '.'))
+    except ValueError:
+        return None
+
+
+def _extract_pipe_table(lines: list[str], series: dict[str, list[float]]) -> None:
+    """Parse a pipe-delimited table, adding each numeric column to *series*.
+
+    Timestamps (values matching \\d{4}-\\d{2}-\\d{2}…) are skipped so that
+    years like 2025 from ISO timestamps are never mistaken for data values.
+    Node-ID and string columns are automatically excluded because they
+    cannot be parsed as floats.
+    """
+    if not lines:
+        return
+    headers = [h.strip() for h in lines[0].split('|')]
+
+    # Identify numeric columns by probing first 5 data rows
+    numeric_cols: set[int] = set()
+    for line in lines[1:6]:
+        cells = [c.strip() for c in line.split('|')]
+        if len(cells) != len(headers):
+            continue
+        for i, cell in enumerate(cells):
+            if _is_timestamp(cell):
+                continue
+            if _try_float(cell) is not None:
+                numeric_cols.add(i)
+
+    # Collect values for those columns
+    for line in lines[1:]:
+        cells = [c.strip() for c in line.split('|')]
+        if len(cells) != len(headers):
+            continue
+        for i in numeric_cols:
+            if i >= len(cells) or i >= len(headers):
+                continue
+            val = _try_float(cells[i])
+            if val is None:
+                continue
+            col_name = headers[i].lower()[:30]
+            series.setdefault(col_name, []).append(val)
+
+
+def _extract_free_text(content: str, series: dict[str, list[float]]) -> None:
+    """Extract label→number pairs from free text, one line at a time.
+
+    Deliberately restricted to single lines so that year numbers in
+    ISO timestamps on the *next* line are never pulled into a preceding
+    label's values (the old bug: 'anomaly\\n2025-01-01' → series[anomaly]=[2025]).
+    """
     number_pattern = re.compile(
-        r'([A-Za-zА-Яа-яёЁ][A-Za-zА-Яа-яёЁ\s]{2,30}?)[\s:]+(\d[\d\s,.]*)',
+        r'([A-Za-zА-Яа-яёЁ][A-Za-zА-Яа-яёЁ\w_]{1,29}?)[\s:=]+(\d[\d,.]*)',
     )
+    for line in content.splitlines():
+        for match in number_pattern.finditer(line):
+            label = match.group(1).strip().lower()[:30]
+            nums = []
+            for n in re.findall(r'\d+(?:[.,]\d+)?', match.group(2))[:20]:
+                v = _try_float(n)
+                if v is not None:
+                    nums.append(v)
+            if nums:
+                series.setdefault(label, []).extend(nums)
+
+
+def _extract_numeric_series(chunks: list[dict]) -> dict[str, list[float]]:
+    """Pre-extract named numeric series from chunks without LLM.
+
+    Dispatches to one of two strategies:
+    - Pipe-table chunks (first line contains ' | '): parse as structured table,
+      skip timestamp columns to avoid extracting years as metric values.
+    - Free-text chunks: regex per-line (single-line only) to avoid year leakage.
+
+    Returns only series with ≥ 2 values, capped at 50 per series.
+    """
+    series: dict[str, list[float]] = {}
     for chunk in chunks:
         content = chunk.get("content", "")
-        for match in number_pattern.finditer(content):
-            label = match.group(1).strip().lower()[:30]
-            nums_str = re.findall(r'\d+(?:[.,]\d+)?', match.group(2))
-            nums = []
-            for n in nums_str[:20]:
-                try:
-                    nums.append(float(n.replace(',', '.')))
-                except ValueError:
-                    pass
-            if nums:
-                if label not in series:
-                    series[label] = nums
-                else:
-                    series[label].extend(nums)
-    # Keep only series with >=2 values
+        lines = [l for l in content.strip().splitlines() if l.strip()]
+        if len(lines) >= 2 and ' | ' in lines[0]:
+            _extract_pipe_table(lines, series)
+        else:
+            _extract_free_text(content, series)
     return {k: v[:50] for k, v in series.items() if len(v) >= 2}
 
 
