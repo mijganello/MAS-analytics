@@ -117,7 +117,11 @@ def extract_report_text(blocks: list[dict]) -> str:
             value  = block.get("value", "")
             unit   = block.get("unit", "")
             norm   = _kpi_value_str(value)
-            parts.append(f"{title}: {norm} {unit}".strip())
+            # Parenthesise unit so _extract_numbers doesn't re-expand
+            # suffixes like "млн"/"млрд" as multipliers (value is already
+            # in those units).
+            unit_str = f" ({unit})" if unit else ""
+            parts.append(f"{title}: {norm}{unit_str}".strip())
             # Also include delta/benchmark if present
             for extra_key in ("delta", "delta_pct", "benchmark"):
                 v = block.get(extra_key)

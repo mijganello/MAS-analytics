@@ -67,7 +67,12 @@ class TextChunker:
 
 
 class TableChunker:
-    MAX_ROWS_PER_CHUNK = 50
+    # Each chunk must fit inside a single LLM context slot (≈ 3 000 chars).
+    # With wide Excel tables (17 cols × ~140 chars/row + 250-char header) the
+    # safe limit is around 15 rows: 250 + 15×140 = 2 350 chars.
+    # Smaller chunks also improve BM25 recall: chunks covering a specific subset
+    # of teachers rank higher for targeted queries than one huge chunk.
+    MAX_ROWS_PER_CHUNK = 15
 
     def chunk_table(self, headers: list[str], rows: list[list[str]], caption: str | None = None, page: int | None = None) -> list[Chunk]:
         chunks = []

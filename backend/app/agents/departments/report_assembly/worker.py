@@ -1,6 +1,7 @@
 from __future__ import annotations
 from pydantic import BaseModel
 from app.agents.base import BaseAgent
+from app.agents.query_mode import is_strict, strict_block_limit
 from app.llm.provider import LLMMessage
 from app.llm.structured import get_session_llm
 from app.schemas.tasks import CriticVerdict, TaskSpec
@@ -24,6 +25,8 @@ class AssemblyWorker(BaseAgent):
 
     async def run(self, task: TaskSpec, all_blocks: list[dict]) -> dict:
         self._log("worker_start", task_id=task.task_id)
+        hints = task.context_hints or {}
+        strict = is_strict(hints)
         dept_str = task.department.value if hasattr(task.department, "value") else str(task.department)
 
         # Order blocks logically without LLM
@@ -41,26 +44,56 @@ class AssemblyWorker(BaseAgent):
         for i, block in enumerate(ordered):
             block["order"] = i
 
-        # LLM generates executive summary
+        if strict:
+            # In strict mode, drop intermediate blocks (raw data tables from extraction)
+            # and keep only answer blocks (kpi_card, text).  Enforce block limit.
+            limit = strict_block_limit(hints)
+            answer_types = {"kpi_card", "text"}
+            # Allow table blocks only if they were NOT produced by data_extraction
+            # (data_extraction tables are raw extracts, not answers)
+            filtered = []
+            for b in ordered:
+                btype = b.get("block_type", "")
+                dept = b.get("created_by_dept", "")
+                if btype in answer_types:
+                    filtered.append(b)
+                elif btype == "table" and dept != "data_extraction":
+                    filtered.append(b)
+            ordered = filtered[:limit]
+            for i, block in enumerate(ordered):
+                block["order"] = i
+
+            toc = [
+                {"block_id": b.get("block_id", ""), "title": b.get("title", ""), "block_type": b.get("block_type", ""), "order": b.get("order", 0)}
+                for b in ordered
+            ]
+            self._log("worker_done", task_id=task.task_id, total_blocks=len(ordered))
+            await self._bb_log(
+                task.session_id, "assembly_complete",
+                f"Строгий режим: {len(ordered)} блоков (отфильтровано)",
+                task_id=task.task_id, department=dept_str,
+                details={"total_blocks": len(ordered), "mode": "strict", "total_before_filter": len(all_blocks)},
+            )
+            return {"blocks": ordered, "toc": toc}
+
+        # LLM generates executive summary (exploratory mode only)
         blocks_summary = str([{
             "type": b.get("block_type"), "title": b.get("title", "")
         } for b in ordered])[:800]
+
+        mode_block = self._mode_prompt(hints)
 
         class SummaryOutput(BaseModel):
             key_findings: list[str]
             recommendations: list[str]
             overall_conclusion: str
 
-        system = """Ты AssemblyWorker — агент компиляции отчёта. Создай исполнительное резюме аналитического отчёта.
-Будь лаконичен.
+        system = f"""Ты AssemblyWorker — агент компиляции отчёта. Создай исполнительное резюме аналитического отчёта.
 
-ОБЯЗАТЕЛЬНО: все поля (key_findings, recommendations, overall_conclusion) должны быть
-ИСКЛЮЧИТЕЛЬНО на РУССКОМ языке. Никаких английских слов или фраз.
+{mode_block}
 
-Верни JSON с полями:
-- key_findings: список из 3–5 ключевых выводов (строки на русском)
-- recommendations: список из 2–3 рекомендаций (строки на русском)
-- overall_conclusion: общий вывод одним абзацем на русском"""
+Будь лаконичен. Все поля на РУССКОМ.
+Верни JSON: key_findings (3–5), recommendations (2–3), overall_conclusion."""
 
         user = f"""Запрос к отчёту: {task.description}
 
@@ -146,8 +179,21 @@ class AssemblyCritic(BaseAgent):
     role = "critic"
     department = "report_assembly"
 
-    async def review(self, task_id: str, report: dict) -> CriticVerdict:
+    async def review(
+        self,
+        task_id: str,
+        report: dict,
+        context_hints: dict | None = None,
+    ) -> CriticVerdict:
         blocks = report.get("blocks", [])
+        if is_strict(context_hints):
+            extra = [b for b in blocks if b.get("block_type") == "executive_summary"]
+            if extra:
+                return CriticVerdict(
+                    task_id=task_id, status="REJECT", score=0.4,
+                    issues=[],
+                    reasoning="В строгом режиме не должно быть executive_summary",
+                )
         if not blocks:
             from app.schemas.tasks import CriticIssue
             return CriticVerdict(

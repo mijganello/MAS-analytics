@@ -41,6 +41,13 @@ def _extract_numbers(text: str) -> list[float]:
     # 1. Non-breaking and hair spaces → regular space for uniform treatment
     text = text.replace('\xa0', ' ').replace('\u202f', ' ')
 
+    # 1b. Drop ISO dates — "2024-06-10" must not yield 2024, 06, 10 as separate numbers
+    text = re.sub(r'\b\d{4}-\d{2}-\d{2}\b', ' ', text)
+
+    # 1c. Drop numbered-list markers ("1.", "2)") — not data claims
+    text = re.sub(r'(?m)^\s*\d+[\.)]\s+', ' ', text)
+    text = re.sub(r'(?<=\s)\d+[\.)]\s+(?=\d)', ' ', text)
+
     # 2. Space-separated thousands: "1 200 345" → "1200345"
     #    Require exactly 3 digits after each space to avoid joining "5 кг" etc.
     text = re.sub(r'(\d) (\d{3})(?!\d)', r'\1\2', text)

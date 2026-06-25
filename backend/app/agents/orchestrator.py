@@ -32,6 +32,12 @@ from app.storage.models import UploadedFile, Session as SessionDB, ReportBlockDB
 from app.storage.postgres import AsyncSessionLocal
 from app.core.config import settings
 from app.core.logging import logger
+from app.agents.query_mode import (
+    build_context_hints,
+    classify_query,
+    filter_blocks_for_mode,
+    is_strict,
+)
 
 
 class ChiefAgent(BaseAgent):
@@ -74,7 +80,8 @@ class ChiefAgent(BaseAgent):
                 file_metas = await self._load_file_metadata(db, file_ids)
 
                 # 2. Plan tasks
-                plan = await self._plan(query, file_metas, llm)
+                query_hints = build_context_hints(query)
+                plan = await self._plan(query, file_metas, llm, query_hints)
                 logger.info("plan_ready", tasks=len(plan.tasks), groups=len(plan.execution_order))
                 await blackboard.append_log(session_id, "plan_created", "ChiefAgent",
                     f"План составлен: {len(plan.tasks)} задач, {len(plan.execution_order)} групп выполнения",
@@ -100,7 +107,7 @@ class ChiefAgent(BaseAgent):
                         f"Группа {group_idx + 1}/{len(plan.execution_order)}: {len(group)} задач параллельно",
                         details={"group_idx": group_idx, "task_ids": group})
                     group_results = await self._execute_group(
-                        session_id, group, plan.tasks, file_ids, db, all_blocks
+                        session_id, group, plan.tasks, file_ids, db, all_blocks, query_hints
                     )
                     all_blocks.extend(group_results)
                     await blackboard.append_log(session_id, "group_done", "ChiefAgent",
@@ -110,7 +117,7 @@ class ChiefAgent(BaseAgent):
                 # 5. Assemble final report
                 await blackboard.append_log(session_id, "assembly_start", "AssemblyWorker",
                     f"Компиляция отчёта. Всего блоков для сборки: {len(all_blocks)}")
-                report = await self._assemble_report(session_id, query, all_blocks, file_ids, db, llm)
+                report = await self._assemble_report(session_id, query, all_blocks, file_ids, db, llm, query_hints)
 
                 # 6. Persist report blocks
                 await self._persist_report(db, session_id, report)
@@ -174,43 +181,48 @@ class ChiefAgent(BaseAgent):
             for f in files
         ]
 
-    async def _plan(self, query: str, file_metas: list[dict], llm: StructuredLLM) -> OrchestratorPlan:
+    async def _plan(
+        self,
+        query: str,
+        file_metas: list[dict],
+        llm: StructuredLLM,
+        query_hints: dict,
+    ) -> OrchestratorPlan:
         files_summary = str(file_metas)[:500]
+        mode = query_hints.get("response_mode", "exploratory")
 
-        # ── Why this prompt uses LightOrchestratorPlan + worker role ──────────
-        # deepseek-reasoner expends 1 000–1 500 reasoning tokens before writing
-        # the actual JSON response, leaving only ~500–800 tokens for the plan
-        # when max_tokens=2000.  A full OrchestratorPlan with 5 tasks in
-        # TaskSpec format (~500 tok/task) needs ~2 500+ tokens — it always gets
-        # truncated, instructor cannot parse the incomplete JSON, and we fall
-        # back to _default_plan on every single session.
-        #
-        # Fix: use deepseek-chat (role="worker") which produces no reasoning
-        # overhead, and use LightOrchestratorPlan whose PlanTask has only
-        # 5 fields (~80 tok/task) instead of 15.  A 6-task plan fits in ~500
-        # output tokens.  We then inflate each PlanTask into a full TaskSpec.
-        # ─────────────────────────────────────────────────────────────────────
+        if mode == "strict":
+            mode_rules = """
+РЕЖИМ ЗАПРОСА: СТРОГИЙ (конкретные вопросы / нумерованный список)
+- Минимальный план: только data_extraction + quant_analysis (если нужны вычисления).
+- НЕ включай qual_analysis, visualization, report_assembly — они не нужны.
+- Обычно достаточно 1–2 задач. Не раздувай план.
+- description каждой задачи = ровно то, что нужно для ответа на пункты запроса."""
+        else:
+            mode_rules = """
+РЕЖИМ ЗАПРОСА: ОБЩИЙ ОТЧЁТ
+- Можно задействовать все отделы по необходимости: extraction, quant, qual, viz, assembly.
+- Добавляй visualization если уместны графики; qual_analysis для текстовых данных."""
 
-        system = """Ты ChiefAgent — оркестратор многоагентной системы генерации аналитических отчётов.
-Декомпозируй аналитический запрос на атомарные подзадачи и распредели по отделам.
+        system = f"""Ты ChiefAgent — оркестратор многоагентной системы генерации аналитических отчётов.
+Декомпозируй запрос на минимально необходимые подзадачи.
 
 ВАЖНО: все поля description и reasoning — строго на РУССКОМ языке.
 
-Доступные отделы (department):
-- data_extraction  — извлечение и верификация данных из документа
-- quant_analysis   — статистика, тренды, прогнозы (инструменты делают математику)
-- qual_analysis    — анализ текста, тональность, риски, резюме
-- visualization    — спецификации графиков и диаграмм
-- report_assembly  — финальный отчёт с исполнительным резюме
+{mode_rules}
 
-Правила компоновки плана:
-1. data_extraction — всегда первым (группа 0)
-2. quant_analysis и qual_analysis — параллельно во второй группе, после data_extraction
-3. visualization — после quant_analysis (зависит от quant-задач)
-4. report_assembly — последним, зависит от всех остальных
-5. task_id — короткая строка без пробелов (напр. "extract_1", "quant_2")
-6. description — не длиннее 200 символов, строго на русском
-7. Не добавляй лишних задач — только те, что нужны для данного запроса
+Доступные отделы (department):
+- data_extraction  — извлечение данных из документа
+- quant_analysis   — вычисления: суммы, средние, проценты, максимумы
+- qual_analysis    — текст, тональность, риски (только в режиме общего отчёта)
+- visualization    — графики (только если явно нужны или общий отчёт)
+- report_assembly  — только для общего отчёта (сборка резюме)
+
+Правила:
+1. data_extraction — первым, если нужны данные из файла
+2. Не добавляй отделы, которые не нужны для данного запроса
+3. task_id — короткая строка (extract_1, quant_1)
+4. description — ≤200 символов, на русском, привязана к запросу
 
 Верни LightOrchestratorPlan JSON."""
 
@@ -219,7 +231,7 @@ class ChiefAgent(BaseAgent):
 Доступные файлы:
 {files_summary}
 
-Составь план: задачи и execution_order (список групп параллельного выполнения)."""
+Составь минимальный план задач и execution_order."""
 
         try:
             light_plan = await llm.complete(
@@ -228,12 +240,11 @@ class ChiefAgent(BaseAgent):
                     LLMMessage(role="user",   content=user),
                 ],
                 response_model=LightOrchestratorPlan,
-                role="worker",        # → deepseek-chat: no reasoning overhead, great at JSON
-                max_tokens=4000,      # ample room: 6 PlanTasks ≈ 480 tokens
+                role="worker",
+                max_tokens=4000,
                 temperature=0.1,
             )
 
-            # Validate execution_order references
             valid_ids = {t.task_id for t in light_plan.tasks}
             clean_order = [
                 [tid for tid in group if tid in valid_ids]
@@ -241,10 +252,25 @@ class ChiefAgent(BaseAgent):
             ]
             clean_order = [g for g in clean_order if g]
             if not clean_order:
-                # Fallback: sequential order if LLM produced empty groups
                 clean_order = [[t.task_id] for t in light_plan.tasks]
 
-            # Inflate PlanTask → full TaskSpec
+            # In strict mode: strip unrequested departments from LLM plan
+            if mode == "strict":
+                allowed = {DepartmentEnum.DATA_EXTRACTION, DepartmentEnum.QUANT_ANALYSIS}
+                if query_hints.get("allow_qualitative"):
+                    allowed.add(DepartmentEnum.QUAL_ANALYSIS)
+                if query_hints.get("allow_visualization"):
+                    allowed.add(DepartmentEnum.VISUALIZATION)
+                light_plan.tasks = [t for t in light_plan.tasks if t.department in allowed]
+                valid_ids = {t.task_id for t in light_plan.tasks}
+                clean_order = [
+                    [tid for tid in group if tid in valid_ids]
+                    for group in clean_order
+                ]
+                clean_order = [g for g in clean_order if g]
+                if not light_plan.tasks:
+                    return self._default_plan(query, query_hints)
+
             tasks = [
                 TaskSpec(
                     task_id=t.task_id,
@@ -253,6 +279,7 @@ class ChiefAgent(BaseAgent):
                     description=t.description,
                     depends_on_tasks=t.depends_on_tasks,
                     expected_output_type=t.expected_output_type,
+                    context_hints=dict(query_hints),
                 )
                 for t in light_plan.tasks
             ]
@@ -265,21 +292,54 @@ class ChiefAgent(BaseAgent):
 
         except Exception as e:
             logger.warning("plan_failed_using_default", error=str(e))
-            return self._default_plan(query)
+            return self._default_plan(query, query_hints)
 
-    def _default_plan(self, query: str) -> OrchestratorPlan:
+    def _default_plan(self, query: str, query_hints: dict | None = None) -> OrchestratorPlan:
         """Резервный план при сбое планировщика LLM."""
-        t1 = TaskSpec(task_id=str(uuid.uuid4()), session_id="pending",
-                      department=DepartmentEnum.DATA_EXTRACTION, description=f"Извлечь ключевые данные для: {query[:100]}",
-                      expected_output_type="table", priority=1)
-        t2 = TaskSpec(task_id=str(uuid.uuid4()), session_id="pending",
-                      department=DepartmentEnum.QUAL_ANALYSIS, description=f"Качественный анализ: {query[:100]}",
-                      expected_output_type="text", priority=2, depends_on_tasks=[t1.task_id])
-        t3 = TaskSpec(task_id=str(uuid.uuid4()), session_id="pending",
-                      department=DepartmentEnum.REPORT_ASSEMBLY, description="Компиляция финального отчёта",
-                      expected_output_type="executive_summary", priority=3, depends_on_tasks=[t1.task_id, t2.task_id])
+        hints = dict(query_hints or build_context_hints(query))
+        mode = hints.get("response_mode", "exploratory")
+
+        t1 = TaskSpec(
+            task_id=str(uuid.uuid4()), session_id="pending",
+            department=DepartmentEnum.DATA_EXTRACTION,
+            description=f"Извлечь данные для ответа: {query[:120]}",
+            expected_output_type="table", priority=1,
+            context_hints=hints,
+        )
+
+        if mode == "strict":
+            t2 = TaskSpec(
+                task_id=str(uuid.uuid4()), session_id="pending",
+                department=DepartmentEnum.QUANT_ANALYSIS,
+                description=f"Вычислить показатели для: {query[:120]}",
+                expected_output_type="kpi_card", priority=2,
+                depends_on_tasks=[t1.task_id],
+                context_hints=hints,
+            )
+            return OrchestratorPlan(
+                reasoning="Строгий резервный план: извлечение + вычисления",
+                tasks=[t1, t2],
+                execution_order=[[t1.task_id], [t2.task_id]],
+            )
+
+        t2 = TaskSpec(
+            task_id=str(uuid.uuid4()), session_id="pending",
+            department=DepartmentEnum.QUAL_ANALYSIS,
+            description=f"Качественный анализ: {query[:100]}",
+            expected_output_type="text", priority=2,
+            depends_on_tasks=[t1.task_id],
+            context_hints=hints,
+        )
+        t3 = TaskSpec(
+            task_id=str(uuid.uuid4()), session_id="pending",
+            department=DepartmentEnum.REPORT_ASSEMBLY,
+            description="Компиляция финального отчёта",
+            expected_output_type="executive_summary", priority=3,
+            depends_on_tasks=[t1.task_id, t2.task_id],
+            context_hints=hints,
+        )
         return OrchestratorPlan(
-            reasoning="Резервный план по умолчанию",
+            reasoning="Резервный план общего отчёта",
             tasks=[t1, t2, t3],
             execution_order=[[t1.task_id], [t2.task_id], [t3.task_id]],
         )
@@ -292,13 +352,16 @@ class ChiefAgent(BaseAgent):
         file_ids: list[str],
         db: AsyncSession,
         existing_blocks: list[dict],
+        query_hints: dict,
     ) -> list[dict]:
         task_map = {t.task_id: t for t in all_tasks}
         tasks_to_run = [task_map[tid] for tid in task_ids if tid in task_map]
 
         async def run_single(task: TaskSpec) -> list[dict]:
             task.session_id = session_id
-            return await self._execute_task(task, file_ids, db, existing_blocks)
+            if not task.context_hints:
+                task.context_hints = dict(query_hints)
+            return await self._execute_task(task, file_ids, db, existing_blocks, query_hints)
 
         results = await asyncio.gather(*[run_single(t) for t in tasks_to_run], return_exceptions=True)
         all_new_blocks = []
@@ -315,6 +378,7 @@ class ChiefAgent(BaseAgent):
         file_ids: list[str],
         db: AsyncSession,
         existing_blocks: list[dict],
+        query_hints: dict,
     ) -> list[dict]:
         dept = task.department
         loop_guard = LoopGuard(task_id=task.task_id, max_retries=settings.max_task_retries)
@@ -334,8 +398,10 @@ class ChiefAgent(BaseAgent):
                 "file_ids": file_ids,
             })
 
-        # Retrieve relevant chunks
-        chunks = await retriever.search(db, task.description, file_ids, top_k=8)
+        # Retrieve relevant chunks.  top_k=12 ensures that wide Excel files
+        # (MAX_ROWS_PER_CHUNK=15 → ~3 chunks per sheet × 3 sheets = ~9 chunks)
+        # are returned in full rather than being cut off at 8.
+        chunks = await retriever.search(db, task.description, file_ids, top_k=12)
         if chunks:
             sources = list(dict.fromkeys(
                 c.get("filename") or c.get("source") or "документ"
@@ -373,24 +439,38 @@ class ChiefAgent(BaseAgent):
                 if dept == DepartmentEnum.DATA_EXTRACTION:
                     from app.agents.departments.data_extraction.worker import DataWorker, DataCritic
                     blocks = await DataWorker().run(task, chunks, fingerprint_json)
-                    verdict = await DataCritic().review(task.task_id, blocks, chunks)
+                    blocks = filter_blocks_for_mode(blocks, task.context_hints or query_hints)
+                    verdict = await DataCritic().review(task.task_id, blocks, chunks, task.context_hints or query_hints)
 
                 elif dept == DepartmentEnum.QUANT_ANALYSIS:
                     from app.agents.departments.quant_analysis.worker import QuantWorker, QuantCritic
                     data_ctx = {b.get("title", ""): b for b in existing_blocks if b.get("block_type") in ("table", "kpi_card")}
                     blocks = await QuantWorker().run(task, chunks, data_ctx)
-                    verdict = await QuantCritic().review(task.task_id, blocks)
+                    blocks = filter_blocks_for_mode(blocks, task.context_hints or query_hints)
+                    verdict = await QuantCritic().review(task.task_id, blocks, task.context_hints or query_hints)
 
                 elif dept == DepartmentEnum.QUAL_ANALYSIS:
+                    if is_strict(task.context_hints or query_hints) and not (task.context_hints or query_hints).get("allow_qualitative"):
+                        await blackboard.append_log(task.session_id, "task_skipped",
+                            "ChiefAgent", "qual_analysis пропущен — не запрошен в строгом режиме",
+                            task_id=task.task_id, department=dept.value)
+                        return []
                     from app.agents.departments.qual_analysis.worker import QualWorker, QualCritic
                     blocks = await QualWorker().run(task, chunks)
-                    verdict = await QualCritic().review(task.task_id, blocks)
+                    blocks = filter_blocks_for_mode(blocks, task.context_hints or query_hints)
+                    verdict = await QualCritic().review(task.task_id, blocks, task.context_hints or query_hints)
 
                 elif dept == DepartmentEnum.VISUALIZATION:
+                    if is_strict(task.context_hints or query_hints) and not (task.context_hints or query_hints).get("allow_visualization"):
+                        await blackboard.append_log(task.session_id, "task_skipped",
+                            "ChiefAgent", "visualization пропущена — графики не запрошены",
+                            task_id=task.task_id, department=dept.value)
+                        return []
                     from app.agents.departments.visualization.worker import VizWorker, VizCritic
                     data_results = {b.get("title", ""): b for b in existing_blocks}
                     blocks = await VizWorker().run(task, data_results)
-                    verdict = await VizCritic().review(task.task_id, blocks)
+                    blocks = filter_blocks_for_mode(blocks, task.context_hints or query_hints)
+                    verdict = await VizCritic().review(task.task_id, blocks, task.context_hints or query_hints)
 
                 elif dept == DepartmentEnum.REPORT_ASSEMBLY:
                     # Assembly is handled separately by _assemble_report() after all groups complete.
@@ -518,6 +598,7 @@ class ChiefAgent(BaseAgent):
         file_ids: list[str],
         db: AsyncSession,
         llm: StructuredLLM,
+        query_hints: dict,
     ) -> ReportSchema:
         from app.agents.departments.report_assembly.worker import AssemblyWorker, AssemblyCritic
 
@@ -525,7 +606,8 @@ class ChiefAgent(BaseAgent):
             task_id=str(uuid.uuid4()),
             session_id=session_id,
             department=DepartmentEnum.REPORT_ASSEMBLY,
-            description=f"Assemble final report for: {query[:100]}",
+            description=query[:200],
+            context_hints=dict(query_hints),
         )
 
         assembled = await AssemblyWorker().run(assembly_task, all_blocks)

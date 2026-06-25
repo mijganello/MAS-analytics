@@ -1,0 +1,11 @@
+dataset_id,mode,latency_s,token_count,answers_correct,answers_total,hi,npi,error
+02_faculty_grades,naive,5.81,1263,4,6,0.0278,0.0,
+02_faculty_grades,mas,27.21,1797,4,6,0.0,0.0,
+01_rocket_launch,naive,4.72,981,5,6,0.06,0.8529,
+01_rocket_launch,mas,22.09,4242,5,6,0.1481,0.8684,
+05_server_logs,naive,9.1,1780,6,6,0.1023,0.9364,
+05_server_logs,mas,27.1,1846,6,6,0.0,1.0,
+04_shop_reviews,naive,8.36,1618,6,6,0.2143,1.0,
+04_shop_reviews,mas,27.1,4676,5,6,0.0,1.0,
+03_teacher_workload,naive,4.62,896,7,7,0.0,1.0,
+03_teacher_workload,mas,22.09,4226,3,7,0.1034,1.0,

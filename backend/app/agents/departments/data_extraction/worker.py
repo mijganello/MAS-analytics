@@ -3,6 +3,7 @@ import json
 from typing import Any
 from pydantic import BaseModel
 from app.agents.base import BaseAgent
+from app.agents.query_mode import is_strict, strict_block_limit
 from app.llm.provider import LLMMessage
 from app.llm.structured import get_session_llm
 from app.schemas.tasks import CriticVerdict, CriticIssue, TaskSpec
@@ -60,35 +61,47 @@ class DataWorker(BaseAgent):
             except Exception:
                 pass
 
-        system = """Ты DataWorker — агент извлечения данных. Твоя задача: извлекать структурированные данные из документов.
+        hints = task.context_hints or {}
+        mode_block = self._mode_prompt(hints)
+        max_blocks = strict_block_limit(hints) if is_strict(hints) else 10
+        strict = is_strict(hints)
+
+        strict_extra = ""
+        if strict:
+            strict_extra = f"""
+СТРОГИЙ РЕЖИМ — КРИТИЧЕСКИ ВАЖНО:
+- Ты НЕ выполняешь вычисления. Твоя единственная задача — извлечь сырые данные.
+- Запрещено создавать kpi_card блоки. Только table с сырыми строками или text.
+- НЕ считай суммы, проценты, средние, максимумы, минимумы — это сделает другой агент.
+- Твоя задача: найти в документе строки/записи и передать их как есть в table.
+- Один блок = одна table со всеми найденными строками.
+- Если данные уже в табличном виде — просто скопируй их в table. Не анализируй."""
+
+        system = f"""Ты DataWorker — агент извлечения данных. Извлекай структурированные данные из документов.
+
+{mode_block}
+{strict_extra}
 
 ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА:
-1. Используй ТОЛЬКО числа и текст, которые явно присутствуют в предоставленном контексте.
-2. НИКОГДА не придумывай числа. Если значение отсутствует в контексте — пропусти это поле или строку целиком.
-3. НЕ вставляй маркеры типа [НЕПРОВЕРЕНО], [UNVERIFIED] или любые другие пометки в поля блоков.
-   Если данных нет — просто не включай их. Неполноту опиши в поле data_quality_notes.
-4. Каждый блок ОБЯЗАТЕЛЬНО должен содержать поле "block_type" со значением ТОЛЬКО из: "table", "kpi_card" или "text".
-   - "kpi_card" — для одного числового показателя (metric_name, value, unit)
-   - "table" — для табличных данных с несколькими строками (columns, rows)
-   - "text" — для текстовых описаний и сводок (content)
-5. ВСЕ текстовые поля (title, content, labels, metric_name, unit и т.д.) — ИСКЛЮЧИТЕЛЬНО на РУССКОМ языке.
-6. Верни НЕ БОЛЕЕ 10 самых важных блоков. Объединяй мелкие kpi_card в таблицы где возможно.
+1. Используй ТОЛЬКО числа и текст из контекста. Не придумывай.
+2. НЕ вставляй маркеры [НЕПРОВЕРЕНО] — просто пропускай отсутствующие данные.
+3. block_type: только "table", "kpi_card" или "text".
+4. Все текстовые поля — на РУССКОМ.
+5. Верни НЕ БОЛЕЕ {max_blocks} блоков. Объединяй KPI в одну table где уместно.
 
-Формат каждого блока:
-- kpi_card: {"block_type": "kpi_card", "title": "...", "metric_name": "...", "value": "123", "unit": "чел."}
-- table: {"block_type": "table", "title": "...", "columns": [{"key": "...", "label": "..."}], "rows": [{...}]}
-- text: {"block_type": "text", "title": "...", "content": "..."}
+Формат:
+- kpi_card: {{"block_type": "kpi_card", "title": "...", "metric_name": "...", "value": "123", "unit": "..."}}
+- table: {{"block_type": "table", "title": "...", "columns": [...], "rows": [...]}}
+- text: {{"block_type": "text", "title": "...", "content": "..."}}
 
-Ответь JSON согласно схеме DataWorkerOutput."""
+Ответь JSON DataWorkerOutput."""
 
         user = f"""Задача: {task.description}
 
 Контекст документа:
 {context}{fingerprint_summary}
 
-Извлеки запрошенные данные и верни структурированные блоки (не более 10).
-Если каких-то данных нет в контексте — просто не включай их (не пиши [НЕПРОВЕРЕНО]).
-Весь текст в блоках — на русском. Вывод должен быть валидным JSON."""
+Извлеки только запрошенные данные. Не более {max_blocks} блоков."""
 
         result = await get_session_llm().complete(
             messages=[LLMMessage(role="system", content=system), LLMMessage(role="user", content=user)],
@@ -99,15 +112,25 @@ class DataWorker(BaseAgent):
 
         self._log("worker_done", task_id=task.task_id, blocks=len(result.blocks))
 
+        # Strict mode safety: drop any kpi_card blocks — DataWorker must only extract raw data
+        blocks_out = [b.model_dump(exclude_none=False) for b in result.blocks]
+        if strict:
+            kpi_dropped = [b for b in blocks_out if b.get("block_type") == "kpi_card"]
+            if kpi_dropped:
+                logger.warning("dataworker_kpi_stripped", task_id=task.task_id,
+                               dropped=len(kpi_dropped),
+                               titles=[b.get("title", "")[:60] for b in kpi_dropped])
+                blocks_out = [b for b in blocks_out if b.get("block_type") != "kpi_card"]
+
         dept_str = task.department.value if hasattr(task.department, "value") else str(task.department)
         await self._bb_log(
             task.session_id, "llm_response",
-            f"Извлечение данных завершено: {len(result.blocks)} блоков. {result.data_quality_notes[:120] if result.data_quality_notes else ''}",
+            f"Извлечение данных завершено: {len(blocks_out)} блоков. {result.data_quality_notes[:120] if result.data_quality_notes else ''}",
             task_id=task.task_id, department=dept_str,
             details={
-                "blocks_count": len(result.blocks),
-                "block_types": [b.block_type for b in result.blocks],
-                "block_titles": [b.title[:60] for b in result.blocks],
+                "blocks_count": len(blocks_out),
+                "block_types": [b.get("block_type") for b in blocks_out],
+                "block_titles": [b.get("title", "")[:60] for b in blocks_out],
                 "reasoning": result.reasoning[:600] if result.reasoning else "",
                 "data_quality_notes": result.data_quality_notes[:400] if result.data_quality_notes else "",
                 "chunks_used": len(chunks),
@@ -115,7 +138,7 @@ class DataWorker(BaseAgent):
             },
         )
 
-        return [b.model_dump(exclude_none=False) for b in result.blocks]
+        return blocks_out
 
 
 class DataCritic(BaseAgent):
@@ -138,7 +161,13 @@ class DataCritic(BaseAgent):
 - Не отклонять только из-за отсутствия единиц измерения, если поле само говорит о типе (attrition_rate, pct, score).
 - Частично заполненные таблицы (где некоторые строки имеют null-поля) допустимы, если это отражает реальность данных."""
 
-    async def review(self, task_id: str, blocks: list[dict], chunks: list[dict]) -> CriticVerdict:
+    async def review(
+        self,
+        task_id: str,
+        blocks: list[dict],
+        chunks: list[dict],
+        context_hints: dict | None = None,
+    ) -> CriticVerdict:
         self._log("critic_start", task_id=task_id)
 
         blocks_str = str(blocks)[:1500]
@@ -166,6 +195,20 @@ class DataCritic(BaseAgent):
                 score=0.3,
                 issues=issues_found,
                 reasoning="Обнаружены критические проблемы формата блоков",
+            )
+
+        if is_strict(context_hints) and len(blocks) > strict_block_limit(context_hints):
+            return CriticVerdict(
+                task_id=task_id,
+                status="REJECT",
+                score=0.5,
+                issues=[CriticIssue(
+                    severity="MAJOR",
+                    category="FORMAT_VIOLATION",
+                    description=f"Слишком много блоков ({len(blocks)}). В строгом режиме нужен минимум.",
+                    suggested_fix="Оставить только блоки с ответами на пункты запроса",
+                )],
+                reasoning="Превышен лимит блоков в строгом режиме",
             )
 
         # LLM quality check

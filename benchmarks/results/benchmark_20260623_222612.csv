@@ -1,0 +1,3 @@
+dataset_id,mode,latency_s,token_count,cost_usd,npi,rss,hi,score,efficiency,error
+01_server_logs,naive,18.87,39446,0.023746,0.8824,1.0,0.1027,0.928,0.2019,
+01_server_logs,mas,53.1,10311,0.006207,1.0,0.62,0.0588,0.8494,0.2116,

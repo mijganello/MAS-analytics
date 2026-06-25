@@ -7,12 +7,14 @@ import { ReportsSidebar } from '@/components/ReportsSidebar'
 import { ThemeToggle } from '@/components/ThemeToggle'
 import { useReportStream } from '@/hooks/useReportStream'
 import { useStore } from '@/app/store'
-import { BarChart3, BookOpen, ScrollText } from 'lucide-react'
+import { api } from '@/lib/api'
+import { BarChart3, BookOpen, ScrollText, Copy, Check } from 'lucide-react'
 
 export const Home: React.FC = () => {
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<'report' | 'log'>('report')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [copied, setCopied] = useState(false)
   const { blocks, isGenerating, logEvents, resetBlocks, resetLog, resetTasks } = useStore()
   const contentRef = useRef<HTMLDivElement>(null)
 
@@ -37,6 +39,33 @@ export const Home: React.FC = () => {
       contentRef.current.scrollTop = contentRef.current.scrollHeight
     }
   }, [blocks.length, isGenerating])
+
+  const copyReportJson = async () => {
+    let json: object
+    if (sessionId) {
+      try {
+        json = await api.getReport(sessionId)
+      } catch {
+        json = { session_id: sessionId, blocks, log_events: logEvents }
+      }
+    } else {
+      json = { blocks, log_events: logEvents }
+    }
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(json, null, 2))
+    } catch {
+      const ta = document.createElement('textarea')
+      ta.value = JSON.stringify(json, null, 2)
+      ta.style.position = 'fixed'
+      ta.style.left = '-9999px'
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand('copy')
+      document.body.removeChild(ta)
+    }
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
 
   return (
     <div className="h-screen flex flex-col bg-background overflow-hidden">
@@ -130,6 +159,27 @@ export const Home: React.FC = () => {
                         )}
                       </button>
                     ))}
+                    {/* Copy JSON button — right-aligned */}
+                    {hasContent && (
+                      <button
+                        onClick={copyReportJson}
+                        className="ml-auto flex items-center gap-1.5 px-3 py-2 text-xs font-medium
+                                   text-muted-foreground hover:text-foreground transition-colors"
+                        title="Скопировать отчёт как JSON"
+                      >
+                        {copied ? (
+                          <>
+                            <Check className="h-3.5 w-3.5 text-green-600" />
+                            <span className="text-green-600">Скопировано</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="h-3.5 w-3.5" />
+                            <span>JSON</span>
+                          </>
+                        )}
+                      </button>
+                    )}
                   </div>
 
                   {activeTab === 'report' ? (

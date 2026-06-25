@@ -1,6 +1,7 @@
 from __future__ import annotations
 from pydantic import BaseModel
 from app.agents.base import BaseAgent
+from app.agents.query_mode import is_strict, strict_block_limit
 from app.llm.provider import LLMMessage
 from app.llm.structured import get_session_llm
 from app.schemas.tasks import CriticVerdict, CriticIssue, TaskSpec
@@ -72,16 +73,20 @@ class QualWorker(BaseAgent):
                 },
             )
 
-        system = """Ты QualWorker — агент качественного анализа. Создавай блоки отчёта на основе результатов NLP-инструментов.
-Доступные типы блоков: "text" и "insight". НЕ используй risk_matrix.
-НЕ анализируй текст повторно — используй только предоставленные результаты NLP.
+        hints = task.context_hints or {}
+        mode_block = self._mode_prompt(hints)
+        max_blocks = 0 if is_strict(hints) and not (hints or {}).get("allow_qualitative") else (2 if is_strict(hints) else 5)
 
-Формат:
-- text: {"block_type": "text", "title": "...", "content": "..."}
-- insight: {"block_type": "insight", "title": "...", "headline": "...", "explanation": "...", "insight_type": "trend|risk|opportunity|anomaly", "severity": "low|medium|high", "confidence": 0.85}
+        if max_blocks == 0:
+            return []
 
-ОБЯЗАТЕЛЬНО: ВСЕ текстовые поля (title, content, headline, explanation, text, description и т.д.)
-должны быть ИСКЛЮЧИТЕЛЬНО на РУССКОМ языке."""
+        system = f"""Ты QualWorker — агент качественного анализа. Создавай блоки на основе NLP-инструментов.
+
+{mode_block}
+
+Доступные типы: "text" и "insight". НЕ используй risk_matrix.
+НЕ анализируй текст повторно — только предоставленные результаты NLP.
+Максимум {max_blocks} блок(ов). Все тексты на РУССКОМ."""
 
         user = f"""Задача: {task.description}
 
@@ -91,7 +96,7 @@ class QualWorker(BaseAgent):
 Контекст документа:
 {context[:800]}
 
-Создай блоки отчёта. У каждого должно быть поле block_type. Весь текст — на русском."""
+Создай до {max_blocks} блок(ов) строго по задаче."""
 
         try:
             output = await get_session_llm().complete(
@@ -125,7 +130,12 @@ class QualCritic(BaseAgent):
     role = "critic"
     department = "qual_analysis"
 
-    async def review(self, task_id: str, blocks: list[dict]) -> CriticVerdict:
+    async def review(
+        self,
+        task_id: str,
+        blocks: list[dict],
+        context_hints: dict | None = None,
+    ) -> CriticVerdict:
         issues = []
         for block in blocks:
             if block.get("block_type") == "text" and not block.get("content", "").strip():
@@ -141,4 +151,13 @@ class QualCritic(BaseAgent):
 
         if issues:
             return CriticVerdict(task_id=task_id, status="REJECT", score=0.4, issues=issues)
+        if is_strict(context_hints) and not (context_hints or {}).get("allow_qualitative") and blocks:
+            return CriticVerdict(
+                task_id=task_id, status="REJECT", score=0.3,
+                issues=[CriticIssue(
+                    severity="MAJOR", category="FORMAT_VIOLATION",
+                    description="Качественные блоки не запрашивались",
+                    suggested_fix="Удалить insight/text аналитику",
+                )],
+            )
         return CriticVerdict(task_id=task_id, status="APPROVED", score=0.82, reasoning="Блоки качественного анализа проверены")

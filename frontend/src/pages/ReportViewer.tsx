@@ -6,7 +6,7 @@ import { BlockRenderer } from '@/components/blocks/BlockRenderer'
 import { BlockErrorBoundary } from '@/components/BlockErrorBoundary'
 import { AgentLog } from '@/components/AgentLog'
 import type { LogEvent } from '@/app/store'
-import { BarChart3, ArrowLeft, Calendar, Cpu, AlertCircle, FileText, ScrollText } from 'lucide-react'
+import { BarChart3, ArrowLeft, Calendar, Cpu, AlertCircle, FileText, ScrollText, Copy, Check } from 'lucide-react'
 import type { ReportBlock } from '@/types/blocks'
 
 type BlockGroup =
@@ -40,6 +40,7 @@ function gridCols(count: number): string {
 export const ReportViewer: React.FC = () => {
   const { sessionId } = useParams<{ sessionId: string }>()
   const [activeTab, setActiveTab] = useState<'report' | 'log'>('report')
+  const [copied, setCopied] = useState(false)
 
   const { data: report, isLoading, error } = useQuery({
     queryKey: ['report', sessionId],
@@ -56,6 +57,27 @@ export const ReportViewer: React.FC = () => {
   })
 
   const logEvents: LogEvent[] = (logData?.events ?? []) as LogEvent[]
+
+  const copyReportJson = async () => {
+    if (!report) return
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(report, null, 2))
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch {
+      // Fallback for older browsers / non-HTTPS
+      const ta = document.createElement('textarea')
+      ta.value = JSON.stringify(report, null, 2)
+      ta.style.position = 'fixed'
+      ta.style.left = '-9999px'
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand('copy')
+      document.body.removeChild(ta)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    }
+  }
 
   return (
     <div className="min-h-screen bg-background">
@@ -124,7 +146,27 @@ export const ReportViewer: React.FC = () => {
           <div className="space-y-6">
             {/* Report header */}
             <div className="rounded-xl border bg-card p-6 space-y-3">
-              <h1 className="text-xl font-bold text-foreground">{report.title}</h1>
+              <div className="flex items-start justify-between gap-3">
+                <h1 className="text-xl font-bold text-foreground">{report.title}</h1>
+                <button
+                  onClick={copyReportJson}
+                  className="shrink-0 inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium
+                             hover:bg-muted transition-colors"
+                  title="Скопировать отчёт как JSON"
+                >
+                  {copied ? (
+                    <>
+                      <Check className="h-3.5 w-3.5 text-green-600" />
+                      <span className="text-green-600">Скопировано</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="h-3.5 w-3.5" />
+                      <span>JSON</span>
+                    </>
+                  )}
+                </button>
+              </div>
               <p className="text-sm text-muted-foreground">{report.query}</p>
               <div className="flex items-center gap-4 text-xs text-muted-foreground pt-1 flex-wrap">
                 <span>Создан: {formatDate(report.created_at)}</span>

@@ -8,7 +8,7 @@ MAS Analytics Benchmark
 
 Использование
 -------------
-    # Все 10 датасетов:
+    # Все 5 датасетов:
     python benchmarks/run_benchmark.py
 
     # Только 3 датасета:
@@ -81,11 +81,17 @@ console = Console()
 
 # ── fixture discovery ─────────────────────────────────────────────────────────
 
-def discover_fixtures(filter_ids: set[str] | None = None) -> list[dict]:
+def discover_fixtures(filter_ids: set[str] | None = None, big: bool = False) -> list[dict]:
     """Scan fixtures/ directory and return sorted list of (data_file, ground_truth) pairs."""
     fixtures: list[dict] = []
+    pattern = "*_big_ground_truth.json" if big else "*_ground_truth.json"
 
-    for gt_file in sorted(FIXTURES_DIR.glob("*_ground_truth.json")):
+    for gt_file in sorted(FIXTURES_DIR.glob(pattern)):
+        # Skip big fixtures when in small mode and vice versa
+        if not big and "_big_ground_truth" in gt_file.name:
+            continue
+        if big and "_big_ground_truth" not in gt_file.name:
+            continue
         try:
             gt = json.loads(gt_file.read_text(encoding="utf-8"))
         except Exception as exc:
@@ -123,21 +129,19 @@ def compute_metrics(raw: dict, fixture: dict) -> dict[str, Any]:
     gt         = fixture["ground_truth"]
 
     if raw.get("error"):
+        total = len(gt.get("expected_numbers", []))
         return {
-            "dataset_id":  dataset_id,
-            "mode":        raw["mode"],
-            "latency_s":   round(raw["latency"], 2),
-            "token_count": raw.get("token_count", 0),
-            "cost_usd":    0.0,
-            "npi":         0.0,
-            "rss":         0.0,
-            "hi":          1.0,
-            "score":       0.0,
-            "efficiency":  0.0,
-            "npi_details": {},
-            "rss_details": {},
-            "hi_samples":  [],
-            "error":       raw["error"],
+            "dataset_id":      dataset_id,
+            "mode":            raw["mode"],
+            "latency_s":       round(raw["latency"], 2),
+            "token_count":     raw.get("token_count", 0),
+            "answers_correct": 0,
+            "answers_total":   total,
+            "hi":              1.0,
+            "npi":             0.0,
+            "answer_checks":   [],
+            "hi_samples":      [],
+            "error":           raw["error"],
         }
 
     m = compute_all_metrics(
@@ -150,6 +154,7 @@ def compute_metrics(raw: dict, fixture: dict) -> dict[str, Any]:
         is_mas          = is_mas,
     )
     m["error"] = None
+    m["response_text"] = raw.get("response_text", "")
     return m
 
 
@@ -170,12 +175,14 @@ async def check_backend(url: str) -> bool:
 async def main(args: argparse.Namespace) -> None:
     backend_url = args.backend
     naive_only  = args.naive_only
+    big         = args.big
     filter_ids  = set(args.datasets.split(",")) if args.datasets else None
 
     # ── banner ────────────────────────────────────────────────────────────────
+    mode_str = "BIG" if big else "small"
     console.print(Panel.fit(
-        "[bold cyan]MAS Analytics Benchmark[/bold cyan]\n"
-        "[dim]DeepSeek-only mode[/dim]",
+        f"[bold cyan]MAS Analytics Benchmark[/bold cyan]\n"
+        f"[dim]DeepSeek-only mode · {mode_str} fixtures[/dim]",
         border_style="cyan",
     ))
 
@@ -207,11 +214,12 @@ async def main(args: argparse.Namespace) -> None:
             )
 
     # ── discover fixtures ─────────────────────────────────────────────────────
-    fixtures = discover_fixtures(filter_ids)
+    fixtures = discover_fixtures(filter_ids, big=big)
     if not fixtures:
+        hint = " --big" if big else ""
         console.print(
-            "[red]Файлы фикстур не найдены. "
-            "Сначала запустите: python benchmarks/generate_fixtures/generate_all.py[/red]"
+            f"[red]Файлы фикстур не найдены. "
+            f"Сначала запустите: python benchmarks/generate_fixtures/generate_all.py{hint}[/red]"
         )
         sys.exit(1)
 
@@ -292,13 +300,12 @@ async def main(args: argparse.Namespace) -> None:
             comparison = compare_results(mas_m, naive_m)
             comparisons.append(comparison)
 
-            imp = comparison["improvement_factor"]
-            imp_str   = f"×{imp}"
-            imp_style = "green" if isinstance(imp, float) and imp >= 1.0 else "red"
+            mas_a = f"{mas_m['answers_correct']}/{mas_m['answers_total']}"
+            nav_a = f"{naive_m['answers_correct']}/{naive_m['answers_total']}"
             console.print(
-                f"  Score: MAS=[green]{mas_m['score']}[/green] "
-                f"Naive=[yellow]{naive_m['score']}[/yellow] "
-                f"→ [{imp_style}]{imp_str}[/{imp_style}]"
+                f"  Answers: MAS=[green]{mas_a}[/green] "
+                f"Naive=[yellow]{nav_a}[/yellow] | "
+                f"PUI: MAS={mas_m['hi']} Naive={naive_m['hi']}"
             )
 
         console.print()
@@ -353,6 +360,11 @@ def parse_args() -> argparse.Namespace:
         "--naive-only",
         action="store_true",
         help="Запустить только наивный метод (бэкенд не нужен).",
+    )
+    parser.add_argument(
+        "--big",
+        action="store_true",
+        help="Использовать большие фикстуры (_big) вместо маленьких (по умолчанию — маленькие).",
     )
     return parser.parse_args()
 

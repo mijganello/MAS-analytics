@@ -10,6 +10,7 @@ from app.schemas.tasks import TaskSpec, LoopGuard, CriticVerdict
 from app.schemas.blocks import ReportBlock
 from app.core.config import settings
 from app.core.logging import logger
+from app.agents.query_mode import strict_mode_instructions, is_strict
 
 
 class BaseAgent(ABC):
@@ -37,10 +38,20 @@ class BaseAgent(ABC):
 
     def _build_context_from_chunks(self, chunks: list[dict]) -> str:
         parts = []
-        for c in chunks[:8]:  # max 8 chunks
+        # Allow up to 12 chunks so that large Excel files with multiple table
+        # chunks per sheet (MAX_ROWS_PER_CHUNK=15 → ~3 chunks / 33-row sheet)
+        # are all visible to the LLM.
+        for c in chunks[:12]:
             header = c.get("section_header") or c.get("chunk_type", "")
-            parts.append(f"[{header}]\n{c['content'][:500]}")
+            # Table chunks may contain up to 15 rows × ~140 chars = 2 100 chars
+            # plus a ~250-char header row — use 3 000 chars to show all rows.
+            # Text / insight chunks stay at 2 000.
+            limit = 3000 if c.get("chunk_type") == "table" else 2000
+            parts.append(f"[{header}]\n{c['content'][:limit]}")
         return "\n\n---\n\n".join(parts)
+
+    def _mode_prompt(self, context_hints: dict | None) -> str:
+        return strict_mode_instructions(context_hints)
 
     def _log(self, action: str, **kwargs) -> None:
         logger.info(action, agent=self.agent_name, department=self.department, **kwargs)
